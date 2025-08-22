@@ -1,0 +1,11 @@
+# Ignore all env folders
+env/
+**/env/
+
+# Ignore .env files
+.env
+**/.env
+
+# Ignore .env.local files
+.env.local
+**/.env.local
