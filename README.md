@@ -316,6 +316,4 @@ python chatgpt_generate.py
 python grok_generate.py
 ```
 
-That’s it—copy this README into your repo and you’re good to go.
-
 
