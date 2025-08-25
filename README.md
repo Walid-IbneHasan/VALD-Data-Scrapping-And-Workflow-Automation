@@ -1,4 +1,3 @@
-```markdown
 # VALD Hub → Insights → 8-Week Programs (Windows)
 
 Automate the full pipeline from **VALD Hub screenshots** → **ChatGPT analysis** → **Grok 8-week training programs**.
