@@ -2,6 +2,8 @@
 import os
 import re
 import time
+import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -36,6 +38,12 @@ ACCORDION_DISCOVERY_TIMEOUT = 30000  # wait up to 30s for accordions to appear
 ACCORDION_STABLE_FOR_MS = 1500  # require count to be stable this long
 ACCORDION_CHECK_INTERVAL = 250
 ACCORDION_SECTION_SETTLE_MS = 600  # settle each section before screenshot
+
+# ===================== WINDOW / VIEWPORT =====================
+# Larger headed window + viewport for bigger, sharper screenshots
+WINDOW_W = 1920
+WINDOW_H = 1080
+DEVICE_SCALE = 2  # 1=normal, 2="Retina-like" crisper element screenshots
 
 
 # ===================== UTILS =====================
@@ -496,124 +504,180 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
     log("FLOW", f"Athlete '{athlete_name}' complete. Total images: {total}")
 
 
+# ===================== CLEANUP RUNNER =====================
+def run_cleanup():
+    """
+    Runs cleanup_vald_images.py in the same directory as this script.
+    Executes even if the main flow raises, thanks to the try/finally in main().
+    """
+    script_path = Path(__file__).with_name("cleanup_vald_images.py")
+    if not script_path.exists():
+        log("CLEAN", "cleanup_vald_images.py not found; skipping.")
+        return
+    try:
+        log("CLEAN", f"Running {script_path.name}...")
+        subprocess.run(
+            [sys.executable, str(script_path)], cwd=str(script_path.parent), check=False
+        )
+        log("CLEAN", "Cleanup finished.")
+    except Exception as e:
+        log("CLEAN", f"Cleanup failed: {e}")
+
+
 # ===================== MAIN =====================
 def main():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=55)
-        page: Optional[Page] = None
+    browser = None
+    context = None
+    page: Optional[Page] = None
 
-        # ----- session -----
-        if os.path.exists(AUTH_FILE):
-            log("SESS", "Loading saved auth state...")
-            context = browser.new_context(storage_state=AUTH_FILE)
-            page = context.new_page()
-            page.goto(BASE_URL)
-            try:
-                expect(page.locator('a[href="/app/profiles"]')).to_be_visible(
-                    timeout=15000
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=False,
+                slow_mo=55,
+                args=[f"--window-size={WINDOW_W},{WINDOW_H}"],
+            )
+
+            # ----- session -----
+            if os.path.exists(AUTH_FILE):
+                log("SESS", "Loading saved auth state...")
+                context = browser.new_context(
+                    storage_state=AUTH_FILE,
+                    viewport={"width": WINDOW_W, "height": WINDOW_H},
+                    device_scale_factor=DEVICE_SCALE,
                 )
-                log("SESS", "Session OK.")
-            except Exception:
-                log("SESS", "Session invalid. Re-authenticating...")
-                context.close()
-                os.remove(AUTH_FILE)
-                context = browser.new_context()
                 page = context.new_page()
+                page.set_viewport_size({"width": WINDOW_W, "height": WINDOW_H})
+                page.goto(BASE_URL)
+                try:
+                    expect(page.locator('a[href="/app/profiles"]')).to_be_visible(
+                        timeout=15000
+                    )
+                    log("SESS", "Session OK.")
+                except Exception:
+                    log("SESS", "Session invalid. Re-authenticating...")
+                    context.close()
+                    os.remove(AUTH_FILE)
+                    context = browser.new_context(
+                        viewport={"width": WINDOW_W, "height": WINDOW_H},
+                        device_scale_factor=DEVICE_SCALE,
+                    )
+                    page = context.new_page()
+                    page.set_viewport_size({"width": WINDOW_W, "height": WINDOW_H})
+                    if not perform_login(page):
+                        return
+                    context.storage_state(path=AUTH_FILE)
+            else:
+                context = browser.new_context(
+                    viewport={"width": WINDOW_W, "height": WINDOW_H},
+                    device_scale_factor=DEVICE_SCALE,
+                )
+                page = context.new_page()
+                page.set_viewport_size({"width": WINDOW_W, "height": WINDOW_H})
                 if not perform_login(page):
-                    browser.close()
                     return
                 context.storage_state(path=AUTH_FILE)
-        else:
-            context = browser.new_context()
-            page = context.new_page()
-            if not perform_login(page):
-                browser.close()
-                return
-            context.storage_state(path=AUTH_FILE)
 
-        # ----- profiles page -----
-        if "/app/profiles" not in page.url:
-            page.locator('a[href="/app/profiles"]').click()
-        expect(page).to_have_url(re.compile(r".*/app/profiles"))
-        log("NAV", "On profiles page; waiting for network idle...")
-        page.wait_for_load_state("networkidle", timeout=30000)
+            # ----- profiles page -----
+            if "/app/profiles" not in page.url:
+                page.locator('a[href="/app/profiles"]').click()
+            expect(page).to_have_url(re.compile(r".*/app/profiles"))
+            log("NAV", "On profiles page; waiting for network idle...")
+            page.wait_for_load_state("networkidle", timeout=30000)
 
-        # ----- filter Fusion Soccer teams -----
-        log("FILTER", "Selecting all 'Fusion Soccer' teams...")
-        groups_dropdown = page.locator(
-            ".react-select__control", has_text="All Groups"
-        ).first
-        expect(groups_dropdown).to_be_visible(timeout=15000)
-        groups_dropdown.click()
-        expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
+            # ----- filter Fusion Soccer teams -----
+            log("FILTER", "Selecting all 'Fusion Soccer' teams...")
+            groups_dropdown = page.locator(
+                ".react-select__control", has_text="All Groups"
+            ).first
+            expect(groups_dropdown).to_be_visible(timeout=15000)
+            groups_dropdown.click()
+            expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
 
-        team_options = page.locator(".react-select__menu .react-select__option")
-        fusion_teams = team_options.filter(has_text=re.compile(r"^Fusion Soccer"))
-        names = [t.strip() for t in fusion_teams.all_inner_texts()]
-        log("FILTER", f"Found {len(names)} teams.")
-        for nm in names:
-            page.get_by_role("option", name=nm).click()
-            log("FILTER", f"Selected: {nm}")
+            team_options = page.locator(".react-select__menu .react-select__option")
+            fusion_teams = team_options.filter(has_text=re.compile(r"^Fusion Soccer"))
+            names = [t.strip() for t in fusion_teams.all_inner_texts()]
+            log("FILTER", f"Found {len(names)} teams.")
+            for nm in names:
+                page.get_by_role("option", name=nm).click()
+                log("FILTER", f"Selected: {nm}")
 
-        # close the select menu
-        page.locator("body").click(position={"x": 5, "y": 5})
-        page.wait_for_load_state("networkidle")
-        log("FILTER", "Done. Starting profiles loop...")
+            # close the select menu
+            page.locator("body").click(position={"x": 5, "y": 5})
+            page.wait_for_load_state("networkidle")
+            log("FILTER", "Done. Starting profiles loop...")
 
-        processed = set()
+            processed = set()
 
-        # ----- table pagination -----
-        while True:
-            rows = page.locator("tbody tr")
-            nrows = rows.count()
-            log("TABLE", f"{nrows} rows on this page.")
+            # ----- table pagination -----
+            while True:
+                rows = page.locator("tbody tr")
+                nrows = rows.count()
+                log("TABLE", f"{nrows} rows on this page.")
 
-            for i in range(nrows):
-                row = rows.nth(i)
-                profile_name = row.locator("td").nth(1).inner_text().strip()
+                for i in range(nrows):
+                    row = rows.nth(i)
+                    profile_name = row.locator("td").nth(1).inner_text().strip()
 
-                # Skip test rows
-                if re.search(r"\d", profile_name):
-                    log("TABLE", f"Skip test profile: {profile_name}")
-                    continue
+                    # Skip test rows
+                    if re.search(r"\d", profile_name):
+                        log("TABLE", f"Skip test profile: {profile_name}")
+                        continue
 
-                safe = sanitize_filename(profile_name)
-                if safe in processed:
-                    log("TABLE", f"Skip already processed: {safe}")
-                    continue
+                    safe = sanitize_filename(profile_name)
+                    if safe in processed:
+                        log("TABLE", f"Skip already processed: {safe}")
+                        continue
 
-                log("START", safe)
-                out_dir = OUTPUT_DIR / safe
-                out_dir.mkdir(parents=True, exist_ok=True)
+                    log("START", safe)
+                    out_dir = OUTPUT_DIR / safe
+                    out_dir.mkdir(parents=True, exist_ok=True)
 
-                # open athlete overview
-                log("NAV", "Opening athlete overview...")
-                row.locator('[aria-label="table-cell-initials"]').click()
-                expect(page).to_have_url(re.compile(r".*/overview"), timeout=30000)
-                page.wait_for_timeout(400)
+                    # open athlete overview
+                    log("NAV", "Opening athlete overview...")
+                    row.locator('[aria-label="table-cell-initials"]').click()
+                    expect(page).to_have_url(re.compile(r".*/overview"), timeout=30000)
+                    page.wait_for_timeout(400)
 
-                try:
-                    take_screens_for_athlete(page, str(out_dir), profile_name)
-                    processed.add(safe)
-                except Exception as e:
-                    log("ERROR", f"While capturing '{safe}': {e}")
+                    try:
+                        take_screens_for_athlete(page, str(out_dir), profile_name)
+                        processed.add(safe)
+                    except Exception as e:
+                        log("ERROR", f"While capturing '{safe}': {e}")
 
-                # back to list
-                log("NAV", "Back to profiles list...")
-                page.go_back()
-                expect(page).to_have_url(re.compile(r".*/app/profiles"), timeout=20000)
+                    # back to list
+                    log("NAV", "Back to profiles list...")
+                    page.go_back()
+                    expect(page).to_have_url(
+                        re.compile(r".*/app/profiles"), timeout=20000
+                    )
+                    page.wait_for_load_state("networkidle")
+
+                next_btn = page.locator('button[aria-label="next page"]')
+                if not next_btn.is_enabled():
+                    log("TABLE", "Last page reached.")
+                    break
+                log("TABLE", "Next page...")
+                next_btn.click()
                 page.wait_for_load_state("networkidle")
 
-            next_btn = page.locator('button[aria-label="next page"]')
-            if not next_btn.is_enabled():
-                log("TABLE", "Last page reached.")
-                break
-            log("TABLE", "Next page...")
-            next_btn.click()
-            page.wait_for_load_state("networkidle")
+            log("DONE", "✅ Automation complete.")
 
-        log("DONE", "✅ Automation complete.")
-        browser.close()
+    except Exception as e:
+        log("ERROR", f"Top-level error: {e}")
+    finally:
+        # Close the browser/context first (if they were started), then run cleanup
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        run_cleanup()
 
 
 if __name__ == "__main__":
