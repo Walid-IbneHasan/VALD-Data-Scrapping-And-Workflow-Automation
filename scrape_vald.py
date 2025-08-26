@@ -59,10 +59,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def move_mouse_off_view(page: Page) -> None:
-    """
-    Nudge the mouse to the top-left of the viewport so any hover tooltips
-    on HumanTrak cards disappear before we screenshot.
-    """
+    """Nudge the mouse to the top-left so hover tooltips disappear before screenshots."""
     try:
         page.mouse.move(0, 0)
         page.wait_for_timeout(150)
@@ -320,18 +317,13 @@ def _wait_for_accordion_count_to_settle(
             stable = 0
         modal.page.wait_for_timeout(interval_ms)
         elapsed += interval_ms
-    # timeout: return whatever we have
     return modal.locator("div.accordion").count()
 
 
 def screenshot_modal_accordions(
     page: Page, modal: Locator, save_dir: Path, prefix: str, counters: defaultdict
 ) -> int:
-    """
-    Screenshot every 'div.accordion'. If none appear in time,
-    fall back to 1 full-modal shot so you still get output.
-    """
-    # Proactively scroll so lazy sections mount
+    """Screenshot each accordion section; if none, take one full-modal shot."""
     _preload_modal_content(modal)
 
     cnt = _wait_for_accordion_count_to_settle(modal)
@@ -344,7 +336,6 @@ def screenshot_modal_accordions(
     total = cnt
     log("MODAL", f"{prefix}: found {total} accordion sections (stable).")
 
-    # Move mouse away from charts to avoid floating tooltips
     try:
         page.mouse.move(5, 5)
     except Exception:
@@ -354,7 +345,6 @@ def screenshot_modal_accordions(
     for i in range(total):
         section = accordions.nth(i)
         try:
-            # Give each section's body a chance to render charts/text
             body = section.locator(
                 ".accordion-body, [data-testid='multiseries-chart'], svg, canvas, .recharts-wrapper"
             ).first
@@ -384,8 +374,6 @@ def open_dropdown_and_select_in_tile(page: Page, tile: Locator, label: str) -> N
     expect(btn).to_be_visible(timeout=12000)
     btn.scroll_into_view_if_needed()
     btn.click()
-
-    # Scope the menu to THIS tile to avoid cross-tile confusion
     menu = tile.locator('[data-testid="metric-dropdown-items"]').first
     expect(menu).to_be_visible(timeout=12000)
 
@@ -396,12 +384,11 @@ def open_dropdown_and_select_in_tile(page: Page, tile: Locator, label: str) -> N
     option.scroll_into_view_if_needed()
     option.click(force=True)
 
-    # Wait for button text to reflect new selection (truncate-aware)
     try:
         span = btn.locator("span.truncate").first
         expect(span).to_have_text(re.compile(re.escape(label)), timeout=5000)
     except Exception:
-        page.wait_for_timeout(400)  # small fallback
+        page.wait_for_timeout(400)
     page.wait_for_timeout(MENU_AFTER_SELECT)
 
 
@@ -412,10 +399,6 @@ def capture_humantrak_card(
     save_dir: Path,
     counters: defaultdict,
 ) -> int:
-    """
-    Screenshot the HumanTrak tile once as-is, then after selecting each requested metric.
-    """
-    # Prefer data-testid="humantrak-tile"; fallback to heading
     tile = tile_humantrak_by_title(page, title)
     if tile.count() == 0 or not tile.is_visible():
         tile = tile_by_heading_fallback(page, title)
@@ -449,7 +432,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
     save_dir.mkdir(parents=True, exist_ok=True)
     counters: defaultdict = defaultdict(int)
 
-    # Make sure page has mounted at least CMJ
     try:
         expect(tile_forcedecks_by_name(page, "Countermovement Jump")).to_be_visible(
             timeout=20000
@@ -458,7 +440,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         log("FLOW", "CMJ tile not found immediately; proceeding anyway.")
     page.wait_for_timeout(300)
 
-    # ---------- Modal tiles (accordion-based) ----------
     for label, opener in [
         (
             "Countermovement_Jump",
@@ -485,7 +466,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         except Exception as e:
             log("FLOW", f"(warn) {label.replace('_',' ')} failed: {e}")
 
-    # ---------- HumanTrak tiles (dropdowns) ----------
     ht_labels = [
         "Avg Hip Adduction at Peak Knee Flexion - Left & Right",
         "Avg Peak Knee Flexion - Left & Right",
@@ -506,10 +486,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
 
 # ===================== CLEANUP RUNNER =====================
 def run_cleanup():
-    """
-    Runs cleanup_vald_images.py in the same directory as this script.
-    Executes even if the main flow raises, thanks to the try/finally in main().
-    """
     script_path = Path(__file__).with_name("cleanup_vald_images.py")
     if not script_path.exists():
         log("CLEAN", "cleanup_vald_images.py not found; skipping.")
@@ -585,8 +561,8 @@ def main():
             log("NAV", "On profiles page; waiting for network idle...")
             page.wait_for_load_state("networkidle", timeout=30000)
 
-            # ----- filter Fusion Soccer teams -----
-            log("FILTER", "Selecting all 'Fusion Soccer' teams...")
+            # ----- filter KC Fusion teams -----
+            log("FILTER", "Selecting all 'KC Fusion' teams...")
             groups_dropdown = page.locator(
                 ".react-select__control", has_text="All Groups"
             ).first
@@ -594,13 +570,20 @@ def main():
             groups_dropdown.click()
             expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
 
+            # Get every option whose visible text starts with "KC Fusion" and click it directly.
             team_options = page.locator(".react-select__menu .react-select__option")
-            fusion_teams = team_options.filter(has_text=re.compile(r"^Fusion Soccer"))
-            names = [t.strip() for t in fusion_teams.all_inner_texts()]
-            log("FILTER", f"Found {len(names)} teams.")
-            for nm in names:
-                page.get_by_role("option", name=nm).click()
-                log("FILTER", f"Selected: {nm}")
+            kc_teams = team_options.filter(has_text=re.compile(r"^KC Fusion"))
+            count = kc_teams.count()
+            log("FILTER", f"Found {count} teams.")
+
+            for i in range(count):
+                opt = kc_teams.nth(i)
+                label = opt.inner_text().strip()
+                opt.scroll_into_view_if_needed()
+                # click the element itself to avoid ambiguous name matching
+                opt.click()
+                log("FILTER", f"Selected: {label}")
+                page.wait_for_timeout(120)  # tiny settle for UI
 
             # close the select menu
             page.locator("body").click(position={"x": 5, "y": 5})
@@ -666,7 +649,6 @@ def main():
     except Exception as e:
         log("ERROR", f"Top-level error: {e}")
     finally:
-        # Close the browser/context first (if they were started), then run cleanup
         try:
             if context:
                 context.close()
