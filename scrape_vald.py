@@ -40,7 +40,6 @@ ACCORDION_CHECK_INTERVAL = 250
 ACCORDION_SECTION_SETTLE_MS = 600  # settle each section before screenshot
 
 # ===================== WINDOW / VIEWPORT =====================
-# Larger headed window + viewport for bigger, sharper screenshots
 WINDOW_W = 1920
 WINDOW_H = 1080
 DEVICE_SCALE = 2  # 1=normal, 2="Retina-like" crisper element screenshots
@@ -368,27 +367,78 @@ def screenshot_modal_accordions(
     return took
 
 
-# ---------- HumanTrak dropdown helpers ----------
-def open_dropdown_and_select_in_tile(page: Page, tile: Locator, label: str) -> None:
+# ---------- HumanTrak dropdown helpers (robust unique selection) ----------
+def short_token_for_label(label: str) -> str:
+    """A short, unique substring we can reliably match in truncated UI text."""
+    if "Ankle Dorsiflexion" in label:
+        return "Ankle Dorsiflexion"
+    if "Hip Adduction" in label:
+        return "Hip Adduction"
+    if "Peak Knee Flexion" in label:
+        return "Peak Knee Flexion"
+    # fallback: first 24 chars
+    return label[:24]
+
+
+def select_metric_and_wait(
+    page: Page, tile: Locator, label: str, timeout_ms: int = 8000
+) -> None:
+    """
+    Open the dropdown, click the exact label, then wait until:
+      1) The button text contains the label's short token (handles truncation)
+      2) The chart DOM changes (when we can detect a Recharts wrapper)
+    This prevents duplicate screenshots after reordering.
+    """
+    token = short_token_for_label(label)
+
+    # Snapshot chart DOM before selection (if present)
+    wrapper = tile.locator(".recharts-wrapper").first
+    html_before = None
+    try:
+        if wrapper.count() > 0:
+            html_before = wrapper.inner_html(timeout=1000)
+    except Exception:
+        html_before = None
+
+    # Open dropdown
     btn = tile.locator('[data-testid="metric-dropdown-button"]').first
     expect(btn).to_be_visible(timeout=12000)
     btn.scroll_into_view_if_needed()
     btn.click()
+
+    # Scope to this tile's menu
     menu = tile.locator('[data-testid="metric-dropdown-items"]').first
     expect(menu).to_be_visible(timeout=12000)
 
-    option = menu.get_by_role(
-        "menuitem", name=re.compile(rf"^{re.escape(label)}\s*$")
-    ).first
-    expect(option).to_be_visible(timeout=12000)
-    option.scroll_into_view_if_needed()
-    option.click(force=True)
+    # Click the exact option text
+    option = menu.get_by_role("menuitem", name=re.compile(rf"^{re.escape(label)}\s*$"))
+    expect(option.first).to_be_visible(timeout=12000)
+    option.first.scroll_into_view_if_needed()
+    option.first.click(force=True)
 
+    # 1) Verify the button text reflects selection (using short token for truncation)
+    span = btn.locator("span.truncate").first
     try:
-        span = btn.locator("span.truncate").first
-        expect(span).to_have_text(re.compile(re.escape(label)), timeout=5000)
+        expect(span).to_contain_text(
+            re.compile(re.escape(token), re.I), timeout=timeout_ms
+        )
     except Exception:
-        page.wait_for_timeout(400)
+        # give the UI another small beat
+        page.wait_for_timeout(600)
+
+    # 2) If we saw the chart wrapper earlier, wait until it changes
+    if html_before is not None:
+        deadline = time.time() + (timeout_ms / 1000.0)
+        while time.time() < deadline:
+            try:
+                html_after = wrapper.inner_html(timeout=500)
+                if html_after != html_before:
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(150)
+
+    # small final settle
     page.wait_for_timeout(MENU_AFTER_SELECT)
 
 
@@ -398,25 +448,36 @@ def capture_humantrak_card(
     labels_to_capture: List[str],
     save_dir: Path,
     counters: defaultdict,
+    include_base: bool = False,  # set False to get exactly 3 shots (one per label)
 ) -> int:
+    """
+    Take exactly one screenshot per requested metric label (and optionally one base shot).
+    Uses robust selection + verification to avoid duplicates when the list reorders itself.
+    """
     tile = tile_humantrak_by_title(page, title)
     if tile.count() == 0 or not tile.is_visible():
         tile = tile_by_heading_fallback(page, title)
-
     expect(tile).to_be_visible(timeout=15000)
 
     taken = 0
-    log("CARD", f"{title}: base screenshot")
-    move_mouse_off_view(page)
-    screenshot_tile(tile, save_dir, title.replace(" ", "_"), counters)
-    taken += 1
 
+    if include_base:
+        log("CARD", f"{title}: base screenshot")
+        move_mouse_off_view(page)
+        screenshot_tile(tile, save_dir, title.replace(" ", "_"), counters)
+        taken += 1
+
+    already_done = set()  # avoid double work by token
     for label in labels_to_capture:
         try:
+            token = short_token_for_label(label)
+            if token in already_done:
+                continue
             log("CARD", f"{title}: selecting '{label}'")
-            open_dropdown_and_select_in_tile(page, tile, label)
+            select_metric_and_wait(page, tile, label)
             move_mouse_off_view(page)
             screenshot_tile(tile, save_dir, title.replace(" ", "_"), counters)
+            already_done.add(token)
             taken += 1
         except Exception as e:
             log("CARD", f"(skip) '{title}' -> '{label}' failed: {e}")
@@ -440,6 +501,7 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         log("FLOW", "CMJ tile not found immediately; proceeding anyway.")
     page.wait_for_timeout(300)
 
+    # ---------- Modal tiles (accordion-based) ----------
     for label, opener in [
         (
             "Countermovement_Jump",
@@ -466,17 +528,25 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         except Exception as e:
             log("FLOW", f"(warn) {label.replace('_',' ')} failed: {e}")
 
+    # ---------- HumanTrak tiles (dropdowns) ----------
     ht_labels = [
-        "Avg Hip Adduction at Peak Knee Flexion - Left & Right",
         "Avg Peak Knee Flexion - Left & Right",
+        "Avg Hip Adduction at Peak Knee Flexion - Left & Right",
+        "Avg Ankle Dorsiflexion at Peak Knee Flexion - Left & Right",
     ]
     try:
-        capture_humantrak_card(page, "Overhead Squat", ht_labels, save_dir, counters)
+        # Exactly 3 images for Overhead Squat (no extra base shot)
+        capture_humantrak_card(
+            page, "Overhead Squat", ht_labels, save_dir, counters, include_base=False
+        )
     except Exception as e:
         log("FLOW", f"(warn) Overhead Squat failed: {e}")
 
     try:
-        capture_humantrak_card(page, "Lunge", ht_labels, save_dir, counters)
+        # Exactly 3 images for Lunge (no extra base shot)
+        capture_humantrak_card(
+            page, "Lunge", ht_labels, save_dir, counters, include_base=False
+        )
     except Exception as e:
         log("FLOW", f"(warn) Lunge failed: {e}")
 
@@ -570,7 +640,6 @@ def main():
             groups_dropdown.click()
             expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
 
-            # Get every option whose visible text starts with "KC Fusion" and click it directly.
             team_options = page.locator(".react-select__menu .react-select__option")
             kc_teams = team_options.filter(has_text=re.compile(r"^KC Fusion"))
             count = kc_teams.count()
@@ -580,10 +649,9 @@ def main():
                 opt = kc_teams.nth(i)
                 label = opt.inner_text().strip()
                 opt.scroll_into_view_if_needed()
-                # click the element itself to avoid ambiguous name matching
                 opt.click()
                 log("FILTER", f"Selected: {label}")
-                page.wait_for_timeout(120)  # tiny settle for UI
+                page.wait_for_timeout(120)
 
             # close the select menu
             page.locator("body").click(position={"x": 5, "y": 5})
