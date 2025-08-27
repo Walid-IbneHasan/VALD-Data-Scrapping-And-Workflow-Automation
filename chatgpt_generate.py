@@ -1,9 +1,12 @@
-# process_athletes.py
+# chatgpt_generate.py
+# (formerly process_athletes.py)
+
 import os
 import time
 import csv
 import base64
 import mimetypes
+import random
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +15,20 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# Try to import granular exception types (works with openai>=1.0)
+try:
+    from openai import RateLimitError, APIError, APIConnectionError, APITimeoutError
+except Exception:  # graceful fallback if symbols not present
+    RateLimitError = APIError = APIConnectionError = APITimeoutError = Exception
+
 # ===================== CONFIG =====================
 BASE_DIR = Path(r"D:\Vald Data")  # Root folder with athlete subfolders
 MODEL = "gpt-4o-mini"  # Vision model
 TEMPERATURE = 0.3
-MAX_RETRIES = 3
-BACKOFF_BASE = 20  # seconds (rate limit backoff)
-RATE_LIMIT_RPM = 2  # <= 2 requests per minute
-SAFE_PACE_SECONDS = 35  # extra pacing between requests
+MAX_RETRIES = 5  # allow a couple more retries
+BACKOFF_BASE = 8  # seconds (base for exponential backoff)
+RATE_LIMIT_RPM = 1  # <= 1 request per minute (RPM hard cap)
+SAFE_PACE_SECONDS = 70  # ~70s padding between requests (TPM safety)
 LOG_CSV = BASE_DIR / "run_log.csv"
 FAILED_LIST = BASE_DIR / "failed.txt"
 SKIP_IF_MARKDOWN_EXISTS = True  # skip athlete if Analysis.md exists
@@ -41,7 +50,6 @@ client = OpenAI(api_key=API_KEY)
 def b64_data_url(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     if not mime:
-        # Default to PNG if unknown
         mime = "image/png"
     with path.open("rb") as f:
         b = base64.b64encode(f.read()).decode("utf-8")
@@ -210,12 +218,12 @@ class RateLimiter:
 
     def wait_for_slot(self):
         now = time.time()
-        # Purge old
+        # Purge old calls outside window
         while self.calls and now - self.calls[0] > self.window:
             self.calls.popleft()
         # If at capacity, sleep until slot frees
         if len(self.calls) >= self.rpm:
-            to_sleep = self.window - (now - self.calls[0]) + 1
+            to_sleep = self.window - (now - self.calls[0]) + 0.5
             if to_sleep > 0:
                 time.sleep(to_sleep)
 
@@ -228,12 +236,17 @@ ensure_log_files()
 
 
 def call_with_retries(model: str, content):
+    """
+    Strict 1 RPM pacing + ~70s extra padding between *successful* calls.
+    Robust 429 handling: exponential backoff with jitter and respect Retry-After when available.
+    """
     attempts = 0
     last_err = None
+
     while attempts < MAX_RETRIES:
         attempts += 1
         try:
-            # Global pacing to be extra safe
+            # Respect RPM cap
             rl.wait_for_slot()
 
             resp = client.chat.completions.create(
@@ -242,19 +255,60 @@ def call_with_retries(model: str, content):
                 temperature=TEMPERATURE,
             )
 
+            # mark a successful call against the RPM bucket
             rl.mark()
-            # Additional gentle pacing between requests
-            time.sleep(SAFE_PACE_SECONDS)
+
+            # Gentle extra padding to stay under TPM (token-per-minute) limits
+            jitter = random.uniform(5, 12)  # add small randomness to desync requests
+            time.sleep(SAFE_PACE_SECONDS + jitter)
 
             msg = resp.choices[0].message.content if resp.choices else ""
             if not msg or not msg.strip():
                 raise RuntimeError("Empty completion content.")
             return msg
-        except Exception as e:
-            last_err = e
-            # Backoff on any error; if rate limit, give more time
-            sleep_for = BACKOFF_BASE * attempts
+
+        except RateLimitError as e:
+            # If we can read Retry-After header, honor it; otherwise exponential + padding.
+            retry_after = None
+            try:
+                retry_after = float(
+                    getattr(getattr(e, "response", None), "headers", {}).get(
+                        "Retry-After", 0
+                    )
+                )
+            except Exception:
+                retry_after = None
+            # base wait: padding + exponential backoff
+            backoff = max(SAFE_PACE_SECONDS + 10, BACKOFF_BASE * (2 ** (attempts - 1)))
+            sleep_for = max(backoff, retry_after or 0)
             time.sleep(sleep_for)
+            last_err = e
+
+        except (APIConnectionError, APITimeoutError) as e:
+            # transient network; exponential backoff with jitter
+            backoff = BACKOFF_BASE * (2 ** (attempts - 1)) + random.uniform(1.0, 4.0)
+            time.sleep(backoff)
+            last_err = e
+
+        except APIError as e:
+            # Server-side hiccup (5xx) -> backoff; 4xx (besides 429) -> likely unrecoverable
+            status = getattr(e, "status_code", None)
+            if status and 500 <= int(status) < 600:
+                backoff = BACKOFF_BASE * (2 ** (attempts - 1)) + random.uniform(
+                    1.0, 4.0
+                )
+                time.sleep(backoff)
+                last_err = e
+            else:
+                # Unrecoverable client error (e.g., 400) — don't spin on it
+                raise
+
+        except Exception as e:
+            # Unknown error: try a conservative backoff once or twice
+            backoff = BACKOFF_BASE * (2 ** (attempts - 1)) + random.uniform(1.0, 3.0)
+            time.sleep(backoff)
+            last_err = e
+
     raise RuntimeError(f"API failed after {MAX_RETRIES} attempts: {last_err}")
 
 
@@ -297,8 +351,6 @@ def process_athlete_folder(folder: Path) -> Optional[Path]:
         return md_path
 
     images = list_images(folder)
-    # Exclude any markdown or txt files implicitly by the filter above
-
     if not images:
         append_log(athlete, "no_images", started, time.time(), "No images found")
         append_failure(athlete, "No images found")

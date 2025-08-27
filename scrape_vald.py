@@ -6,7 +6,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
 from playwright.sync_api import (
@@ -376,7 +376,6 @@ def short_token_for_label(label: str) -> str:
         return "Hip Adduction"
     if "Peak Knee Flexion" in label:
         return "Peak Knee Flexion"
-    # fallback: first 24 chars
     return label[:24]
 
 
@@ -423,7 +422,6 @@ def select_metric_and_wait(
             re.compile(re.escape(token), re.I), timeout=timeout_ms
         )
     except Exception:
-        # give the UI another small beat
         page.wait_for_timeout(600)
 
     # 2) If we saw the chart wrapper earlier, wait until it changes
@@ -438,7 +436,6 @@ def select_metric_and_wait(
                 pass
             page.wait_for_timeout(150)
 
-    # small final settle
     page.wait_for_timeout(MENU_AFTER_SELECT)
 
 
@@ -484,6 +481,161 @@ def capture_humantrak_card(
 
     log("CARD", f"{title}: done ({taken} shots)")
     return taken
+
+
+# ===================== TEAM MENU HELPERS (interactive choice) =====================
+def _open_groups_menu(page: Page) -> Locator:
+    groups_dropdown = page.locator(
+        ".react-select__control", has_text="All Groups"
+    ).first
+    expect(groups_dropdown).to_be_visible(timeout=15000)
+    groups_dropdown.click()
+    menu = page.locator(".react-select__menu").first
+    expect(menu).to_be_visible(timeout=15000)
+    return menu
+
+
+def _menu_list(menu: Locator) -> Locator:
+    return menu.locator(".react-select__menu-list").first
+
+
+def _scroll_menu_once(menu_list: Locator, px: int = 360):
+    try:
+        menu_list.evaluate(
+            "el => { el.scrollTop = Math.min(el.scrollTop + %d, el.scrollHeight); }"
+            % px
+        )
+    except Exception:
+        pass
+
+
+def _find_option_exact(menu: Locator, label: str) -> Optional[Locator]:
+    opt = menu.locator(
+        ".react-select__option",
+        has_text=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE),
+    ).first
+    return opt if opt.count() > 0 else None
+
+
+def _find_options_prefix(menu: Locator, prefix: str) -> List[str]:
+    opts = menu.locator(".react-select__option")
+    labels = []
+    n = opts.count()
+    for i in range(n):
+        txt = opts.nth(i).inner_text().strip()
+        if txt.lower().startswith(prefix.lower()):
+            labels.append(txt)
+    return labels
+
+
+def _is_selected(opt: Locator) -> bool:
+    try:
+        return (opt.get_attribute("aria-selected") or "").lower() == "true"
+    except Exception:
+        return False
+
+
+def _click_if_not_selected(opt: Locator, label_for_log: str):
+    if not _is_selected(opt):
+        opt.scroll_into_view_if_needed()
+        opt.click()
+        log("FILTER", f"Selected: {label_for_log}")
+        return True
+    else:
+        log("FILTER", f"Already selected: {label_for_log}")
+        return False
+
+
+def prompt_team_selection_mode() -> Tuple[str, str | List[str]]:
+    """
+    Returns:
+      ("prefix", prefix_string)  or  ("list", [labels...])
+    """
+    print("\n=== TEAM SELECTION ===")
+    print(
+        "1) Prefix mode  -> select ALL teams whose name starts with your text (e.g., 'KC Fusion')"
+    )
+    print(
+        "2) List mode    -> paste a list of exact team names (comma/newline separated),"
+    )
+    print("                   or enter a path to a .txt file with one team per line.")
+    choice = input("Choose 1 or 2 [default 1]: ").strip() or "1"
+
+    if choice == "2":
+        raw = input(
+            "Paste team names (comma/newline separated) OR enter a file path: "
+        ).strip()
+        if raw and Path(raw).exists() and Path(raw).is_file():
+            text = Path(raw).read_text(encoding="utf-8", errors="ignore")
+            labels = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
+        else:
+            parts = re.split(r"[,;\r\n]+", raw)
+            labels = [p.strip() for p in parts if p.strip()]
+        print(f"[INFO] {len(labels)} team(s) provided.")
+        return "list", labels
+
+    prefix = input("Enter starting text [default: KC Fusion]: ").strip() or "KC Fusion"
+    print(f"[INFO] Using prefix: {prefix!r}")
+    return "prefix", prefix
+
+
+def select_teams_by_list(page: Page, labels: List[str]) -> None:
+    menu = _open_groups_menu(page)
+    menu_list = _menu_list(menu)
+
+    for label in labels:
+        opt = _find_option_exact(menu, label)
+        tries = 0
+        while opt is None and tries < 20:
+            _scroll_menu_once(menu_list)
+            page.wait_for_timeout(80)
+            opt = _find_option_exact(menu, label)
+            tries += 1
+
+        if opt is None:
+            log("FILTER", f"(warn) Could not find team: {label}")
+        else:
+            _click_if_not_selected(opt, label)
+            page.wait_for_timeout(120)
+
+    # close menu
+    page.locator("body").click(position={"x": 5, "y": 5})
+    page.wait_for_load_state("networkidle")
+
+
+def select_teams_by_prefix(page: Page, prefix: str) -> None:
+    menu = _open_groups_menu(page)
+    menu_list = _menu_list(menu)
+
+    discovered = set()
+    passes = 0
+    max_passes = 40  # enough to walk a long list
+
+    while passes < max_passes:
+        labels = _find_options_prefix(menu, prefix)
+        new_labels = [l for l in labels if l not in discovered]
+        if not new_labels:
+            prev = len(discovered)
+            _scroll_menu_once(menu_list)
+            page.wait_for_timeout(120)
+            labels = _find_options_prefix(menu, prefix)
+            if len(discovered) == prev and not labels:
+                break
+            passes += 1
+            continue
+
+        for label in new_labels:
+            opt = _find_option_exact(menu, label)
+            if opt:
+                _click_if_not_selected(opt, label)
+                page.wait_for_timeout(120)
+            discovered.add(label)
+
+        passes += 1
+
+    # close menu
+    page.locator("body").click(position={"x": 5, "y": 5})
+    page.wait_for_load_state("networkidle")
 
 
 # ===================== PER-ATHLETE FLOW =====================
@@ -535,7 +687,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         "Avg Ankle Dorsiflexion at Peak Knee Flexion - Left & Right",
     ]
     try:
-        # Exactly 3 images for Overhead Squat (no extra base shot)
         capture_humantrak_card(
             page, "Overhead Squat", ht_labels, save_dir, counters, include_base=False
         )
@@ -543,7 +694,6 @@ def take_screens_for_athlete(page: Page, out_dir: str, athlete_name: str) -> Non
         log("FLOW", f"(warn) Overhead Squat failed: {e}")
 
     try:
-        # Exactly 3 images for Lunge (no extra base shot)
         capture_humantrak_card(
             page, "Lunge", ht_labels, save_dir, counters, include_base=False
         )
@@ -631,31 +781,17 @@ def main():
             log("NAV", "On profiles page; waiting for network idle...")
             page.wait_for_load_state("networkidle", timeout=30000)
 
-            # ----- filter KC Fusion teams -----
-            log("FILTER", "Selecting all 'KC Fusion' teams...")
-            groups_dropdown = page.locator(
-                ".react-select__control", has_text="All Groups"
-            ).first
-            expect(groups_dropdown).to_be_visible(timeout=15000)
-            groups_dropdown.click()
-            expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
+            # ----- ask user how to select teams -----
+            mode, value = prompt_team_selection_mode()
 
-            team_options = page.locator(".react-select__menu .react-select__option")
-            kc_teams = team_options.filter(has_text=re.compile(r"^KC Fusion"))
-            count = kc_teams.count()
-            log("FILTER", f"Found {count} teams.")
+            if mode == "prefix":
+                log("FILTER", f"Selecting all teams starting with '{value}' ...")
+                select_teams_by_prefix(page, value)
+            else:
+                labels: List[str] = value  # type: ignore
+                log("FILTER", f"Selecting explicit list ({len(labels)} team(s)) ...")
+                select_teams_by_list(page, labels)
 
-            for i in range(count):
-                opt = kc_teams.nth(i)
-                label = opt.inner_text().strip()
-                opt.scroll_into_view_if_needed()
-                opt.click()
-                log("FILTER", f"Selected: {label}")
-                page.wait_for_timeout(120)
-
-            # close the select menu
-            page.locator("body").click(position={"x": 5, "y": 5})
-            page.wait_for_load_state("networkidle")
             log("FILTER", "Done. Starting profiles loop...")
 
             processed = set()
