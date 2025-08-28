@@ -1,17 +1,33 @@
 """
-Remove specific "test" screenshots from every athlete folder under a VALD data root.
+Remove specific "test" screenshots and prune empty athlete/team folders.
 
-Defaults to D:/Vald Data but allows overriding with --root.
+Primary structure:
+  D:/Vald Data/<Team Name>/<Athlete Name>/
 
-Deletes ONLY these files if present inside each athlete folder:
+Back-compat (optional auto-scan):
+  D:/Vald Data/<Athlete Name>/   (if it directly contains images)
+
+Deletes ONLY these files inside each athlete folder, if present:
 - Countermovement_Jump_001.png
 - 20yd_Sprint_001.png
 - 5-0-5_Drill_001.png
 - Nordic_001.png
+
+Then removes the athlete folder if it is COMPLETELY EMPTY (no files/subfolders).
+Optionally remove the team folder too if it becomes empty (--prune-empty-teams).
+
+Usage:
+  python cleanup_vald_images.py
+  python cleanup_vald_images.py --root "D:\\Vald Data"
+  python cleanup_vald_images.py --dry-run
+  python cleanup_vald_images.py --teams "KC Fusion 10G Navy,KC Fusion 12B Gold"
+  python cleanup_vald_images.py --prune-empty-teams
 """
 
 from pathlib import Path
 import argparse
+from typing import Iterable, List
+import os
 
 TARGET_FILENAMES = [
     "Countermovement_Jump_001.png",
@@ -20,54 +36,210 @@ TARGET_FILENAMES = [
     "Nordic_001.png",
 ]
 
+VALID_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
-def remove_targets(root: Path) -> None:
+
+def iter_team_dirs(root: Path) -> Iterable[Path]:
+    """Yield team directories directly under the root."""
+    for child in root.iterdir():
+        if child.is_dir():
+            yield child
+
+
+def iter_athlete_dirs(team_dir: Path) -> Iterable[Path]:
+    """Yield athlete directories directly under a team directory."""
+    for child in team_dir.iterdir():
+        if child.is_dir():
+            yield child
+
+
+def is_dir_completely_empty(p: Path) -> bool:
+    """True if directory has zero entries (no files, no subfolders)."""
+    try:
+        next(p.iterdir())
+        return False
+    except StopIteration:
+        return True
+
+
+def delete_targets_in_athlete_dir(athlete_dir: Path, dry_run: bool = False) -> int:
+    """Delete target files in a single athlete folder. Returns count deleted."""
+    deleted_here = 0
+    for filename in TARGET_FILENAMES:
+        path = athlete_dir / filename
+        try:
+            if path.exists():
+                if dry_run:
+                    print(f"[DRY] Would delete: {path}")
+                else:
+                    path.unlink()
+                    print(f"[DEL] {path}")
+                deleted_here += 1
+        except PermissionError:
+            print(f"[SKIP] Permission denied: {path}")
+        except Exception as e:
+            print(f"[SKIP] {path} -> {e}")
+    return deleted_here
+
+
+def folder_directly_contains_images(folder: Path) -> bool:
+    """Heuristic to detect athlete folders directly under root (back-compat)."""
+    try:
+        for name in os.listdir(folder):
+            p = folder / name
+            if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTS:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def cleanup_team_tree(
+    root: Path, teams_filter: List[str], dry_run: bool, prune_empty_teams: bool
+) -> None:
+    """Scan root/team/athlete and remove target files + prune empty folders."""
     if not root.exists() or not root.is_dir():
         print(f"[ERR] Root does not exist or is not a directory: {root}")
         return
 
-    total_deleted = 0
-    folders_seen = 0
+    teams_filter_norm = (
+        {t.strip().lower() for t in teams_filter if t.strip()}
+        if teams_filter
+        else set()
+    )
 
-    for child in root.iterdir():
-        if not child.is_dir():
+    teams_seen = 0
+    athletes_seen = 0
+    files_deleted = 0
+    athlete_dirs_removed = 0
+    team_dirs_removed = 0
+
+    # ---------- Team -> Athlete structure ----------
+    for team_dir in iter_team_dirs(root):
+        team_name = team_dir.name
+        # Treat directories that obviously look like athlete folders (contain images directly) as back-compat; skip here
+        # They will be handled in the back-compat pass below.
+        if folder_directly_contains_images(team_dir):
             continue
-        folders_seen += 1
-        deleted_here = 0
 
-        for filename in TARGET_FILENAMES:
-            path = child / filename
+        if teams_filter_norm and team_name.lower() not in teams_filter_norm:
+            continue
+
+        print(f"\n[TEAM] {team_name}")
+        teams_seen += 1
+
+        for athlete_dir in iter_athlete_dirs(team_dir):
+            athletes_seen += 1
+
+            # 1) Delete target files
+            files_deleted += delete_targets_in_athlete_dir(athlete_dir, dry_run=dry_run)
+
+            # 2) If now empty, remove athlete folder
             try:
-                if path.exists():
-                    path.unlink()
-                    print(f"[DEL] {path}")
-                    total_deleted += 1
-                    deleted_here += 1
+                if is_dir_completely_empty(athlete_dir):
+                    if dry_run:
+                        print(f"[DRY] Would remove empty athlete folder: {athlete_dir}")
+                    else:
+                        athlete_dir.rmdir()
+                        print(f"[DEL] {athlete_dir}")
+                    athlete_dirs_removed += 1
+                else:
+                    print(f"[KEEP] {athlete_dir} (not empty)")
             except PermissionError:
-                print(f"[SKIP] Permission denied: {path}")
+                print(f"[SKIP] Permission denied: {athlete_dir}")
             except Exception as e:
-                print(f"[SKIP] {path} -> {e}")
+                print(f"[SKIP] {athlete_dir} -> {e}")
 
-        if deleted_here == 0:
-            # Quiet by default, but you can uncomment next line if you want per-folder status.
-            # print(f"[OK ] No targets in: {child.name}")
-            pass
+        # 3) Optionally prune team folder if it became empty
+        if prune_empty_teams:
+            try:
+                if is_dir_completely_empty(team_dir):
+                    if dry_run:
+                        print(f"[DRY] Would remove empty team folder: {team_dir}")
+                    else:
+                        team_dir.rmdir()
+                        print(f"[DEL] {team_dir}")
+                    team_dirs_removed += 1
+            except PermissionError:
+                print(f"[SKIP] Permission denied (team): {team_dir}")
+            except Exception as e:
+                print(f"[SKIP] {team_dir} -> {e}")
 
-    print(f"\nDone. Folders scanned: {folders_seen} | Files deleted: {total_deleted}")
+    # ---------- Back-compat: athletes directly under root ----------
+    # Only folders with images are treated as athlete folders here.
+    direct_athletes = [
+        p for p in root.iterdir() if p.is_dir() and folder_directly_contains_images(p)
+    ]
+    if direct_athletes:
+        print(
+            "\n[INFO] Also scanning athlete folders directly under root (back-compat)."
+        )
+    for athlete_dir in direct_athletes:
+        athletes_seen += 1
+        files_deleted += delete_targets_in_athlete_dir(athlete_dir, dry_run=dry_run)
+        try:
+            if is_dir_completely_empty(athlete_dir):
+                if dry_run:
+                    print(f"[DRY] Would remove empty athlete folder: {athlete_dir}")
+                else:
+                    athlete_dir.rmdir()
+                    print(f"[DEL] {athlete_dir}")
+                athlete_dirs_removed += 1
+            else:
+                print(f"[KEEP] {athlete_dir} (not empty)")
+        except PermissionError:
+            print(f"[SKIP] Permission denied: {athlete_dir}")
+        except Exception as e:
+            print(f"[SKIP] {athlete_dir} -> {e}")
+
+    # ---------- Summary ----------
+    print(
+        f"\nDone. Teams scanned: {teams_seen} | Athlete folders checked: {athletes_seen} | "
+        f"Files {'to be deleted' if dry_run else 'deleted'}: {files_deleted} | "
+        f"Athlete folders {'to be removed' if dry_run else 'removed'}: {athlete_dirs_removed}"
+        + (
+            f" | Team folders {'to be removed' if dry_run else 'removed'}: {team_dirs_removed}"
+            if prune_empty_teams
+            else ""
+        )
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Clean VALD test screenshots per athlete folder."
+        description="Delete VALD 'test' screenshots and remove COMPLETELY EMPTY athlete/team folders."
     )
     parser.add_argument(
         "--root",
         type=str,
         default=r"D:\Vald Data",
-        help='Root directory containing athlete folders (default: "D:\\Vald Data")',
+        help='Root directory containing team folders (default: "D:\\Vald Data")',
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted without actually deleting.",
+    )
+    parser.add_argument(
+        "--teams",
+        type=str,
+        default="",
+        help="Comma-separated list of team names to limit the cleanup (exact match).",
+    )
+    parser.add_argument(
+        "--prune-empty-teams",
+        action="store_true",
+        help="Also remove a team folder if it ends up completely empty.",
     )
     args = parser.parse_args()
-    remove_targets(Path(args.root))
+
+    teams_filter = [t.strip() for t in args.teams.split(",")] if args.teams else []
+    cleanup_team_tree(
+        Path(args.root),
+        teams_filter=teams_filter,
+        dry_run=args.dry_run,
+        prune_empty_teams=args.prune_empty_teams,
+    )
 
 
 if __name__ == "__main__":

@@ -1,319 +1,289 @@
-# VALD Hub → Insights → 8-Week Programs (Windows)
+# VALD Scraper & Report Generators — (Team → Athlete)
 
-Automate the full pipeline from **VALD Hub screenshots** → **ChatGPT analysis** → **Grok 8-week training programs**.
+This project automates three things:
 
-- ✅ Scrape athlete screenshots (CMJ, Nordic, 20yd Sprint, 5-0-5, Overhead Squat, Lunge)
-- ✅ (Optional) Clean out “test” screenshots
-- ✅ Generate **per-athlete analysis** with **GPT-4o mini** (Markdown)
-- ✅ Generate **8-week training program** with **xAI Grok 3 Mini** (Word `.docx`)
+1. **Scrape** each athlete’s test screenshots from VALD Hub into
+   `D:\Vald Data\<Team Name>\<Athlete Name>\*.png`
 
-**Output layout**
+2. **Clean** unwanted “\_001” screenshots and remove **empty athlete/team folders**
 
-```
+3. **Generate reports**
 
-D:\Vald Data
-├─ Athlete A
-│   ├─ \*.png (19 images after cleanup)
-│   ├─ Athlete A Analysis.md
-│   └─ Athlete A 8 Weeks Training Program.docx
-└─ Athlete B\\
-
-````
+   * `chatgpt_generate.py` → reads images and writes **Analysis.md** (per athlete)
+   * `grok_generate.py` → reads **Analysis.md** and writes **8-week training program .docx** (per athlete)
 
 ---
 
-## 🚀 What’s new (compared to the previous version)
+## 1) Requirements
 
-- **Accordion-based screenshots** for CMJ/Nordic/Sprint/5-0-5 with **patient loading**  
-  (stable detection, discovery timeout, settle delays)
-- **Device-scale + larger viewport** for sharper images
-- **HumanTrak tiles**: Overhead Squat & Lunge (base + 2 metrics) with **mouse moved off** to avoid tooltips
-- **Cleanup script** to remove 4 test screenshots (`*_001.png`) in all athlete folders
-- **Flexible image intake** (no strict file names; uses whatever images remain)
-- **ChatGPT analysis**: one request per athlete (19 images), **11–16 yrs female** cohort (no per-athlete age scraping)
-- **Grok 8-week program** generated from the analysis to a **.docx** file
-- **Robust rate-limiting** (2 requests/min) + retries and backoff
-- **Alphabetical processing**, logs (`run_log.csv`, `run_grok_log.csv`) and **failed lists** for easy re-runs
-- **Skip/overwrite controls** for outputs
+* **Python 3.10+**
+* **Node/Webkit for Playwright browsers**
 
----
+  ```bash
+  pip install -r requirements.txt  # if you keep one
+  playwright install
+  ```
+* Python packages:
 
-## 🧰 Prerequisites
-
-- **Windows 10/11**
-- **Python 3.10+**
-- **PowerShell** terminal
-- Accounts & keys:
-  - VALD Hub email + password
-  - **OpenAI API key** for ChatGPT (GPT-4o mini)
-  - **xAI API key** for Grok (grok-3-mini)
+  * `playwright`, `python-dotenv`
+  * `openai` (used both for OpenAI and xAI “OpenAI-compatible” clients)
+  * `python-docx` (for .docx output)
+* A `.env` file (see below)
 
 ---
 
-## 🔧 Setup (one-time)
+## 2) Environment (.env)
 
-Open PowerShell in your project folder and run:
+Create a `.env` in the project root:
 
-```powershell
-# 1) Create & activate a virtual environment
-python -m venv env
-env\Scripts\activate
-
-# 2) Install dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 3) Install Playwright browsers (Chromium)
-python -m playwright install
-````
-
-**`requirements.txt` (example)**
-
-```
-playwright
-python-dotenv
-openai
-python-docx
-```
-
-> If you don’t have a `requirements.txt`, just run:
-> `pip install playwright python-dotenv openai python-docx`
-
----
-
-## 🔐 Create your `.env`
-
-Create a file named `.env` in the project root:
-
-```dotenv
+```ini
 # VALD Hub login
-EMAIL=your_email_here
-PASSWORD=your_password_here
+EMAIL=you@example.com
+PASSWORD=your_vald_password
 
-# OpenAI (ChatGPT)
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+# OpenAI for Analysis (chatgpt_generate.py)
+OPENAI_API_KEY=sk-...
 
-# xAI (Grok)
-XAI_API_KEY=xai-xxxxxxxxxxxxxxxx
+# xAI for Training Program (grok_generate.py)
+XAI_API_KEY=xai-...
 ```
 
 ---
 
-## ▶️ Run the pipeline
+## 3) Output structure
 
-### 1) Scrape VALD → athlete screenshots
+All scripts assume a single base folder (default `D:\Vald Data`) with this shape:
 
-```powershell
-env\Scripts\activate
+```
+D:\Vald Data\
+  ├─ <Team A>\
+  │   ├─ <Athlete 1>\   # images (.png) + "<Athlete 1> Analysis.md" + "<Athlete 1> 8 Weeks Training Program.docx"
+  │   └─ <Athlete 2>\
+  └─ <Team B>\
+      └─ <Athlete N>\
+```
+
+You can change the base path in each script via `--base-dir` (generators) or `--root` (cleanup) or by editing the constant in `scrape_vald.py`.
+
+---
+
+## 4) `scrape_vald.py` — Scrape VALD screenshots
+
+### What it captures
+
+Per athlete (on the Overview page):
+
+* **Modals (accordion screenshots)**
+
+  * Countermovement Jump (CMJ) — \~6 sections
+  * Nordic — \~7 sections
+  * 20yd Sprint — \~2 sections
+  * 5-0-5 Drill — \~2 sections
+
+* **HumanTrak cards (dropdown metrics, 1 shot each)**
+
+  * **Overhead Squat**:
+
+    * Avg Peak Knee Flexion — L/R
+    * Avg Hip Adduction at Peak Knee Flexion — L/R
+    * Avg Ankle Dorsiflexion at Peak Knee Flexion — L/R
+  * **Lunge**: same 3 metrics
+
+The script uses **pixel hashing** to avoid duplicate images and robust waits for charts/menus.
+
+### Interactive team selection (what you’ll be asked)
+
+When you run the scraper, you’ll see:
+
+```
+=== Team selection ===
+1) Start-text mode (e.g., 'KC Fusion' -> process ALL teams that start with it)
+2) Explicit list (paste comma-separated names OR path to a .txt with one per line)
+Pick 1 or 2 (default 1):
+```
+
+* **Option 1 (Start-text / prefix)**
+  Type a word/phrase that the team **starts with**, e.g. `KC Fusion`.
+  The script will scrape **all teams whose names start with that text**.
+
+* **Option 2 (Explicit list)**
+  Paste a comma-separated list:
+  `KC Fusion 07/08G Navy GA, KC Fusion 09G Navy, KC Fusion 10G Navy`
+  **Or** provide a path to a `.txt` file with one team name per line.
+
+### Guarantees about team isolation
+
+* Before each team is processed, we **clear** any previous selection chips in the dropdown.
+* We **re-open** the dropdown and select **exactly one** team.
+* We verify we’re on the Profiles page and wait for **network idle**.
+* This prevents “players leaking into the next team”.
+
+### After each team
+
+The script **clicks the dropdown’s clear indicator (×)** or removes chips to ensure no residual filters remain before moving to the next team.
+
+### Run it
+
+```bash
 python scrape_vald.py
 ```
 
-**What it does**
+Tips:
 
-* Logs into VALD Hub using `.env`.
-* On **Profiles**, selects all matching teams (default: any name starting with **“Fusion Soccer”**).
-* For each athlete (skips obvious test rows), opens the overview and:
-
-  * Opens modals (CMJ, Nordic, 20yd Sprint, 5-0-5) and screenshots **each accordion section**.
-  * Captures **Overhead Squat** & **Lunge** cards (base + 2 metrics) while **moving the mouse off** to avoid tooltips.
-* Saves images under `D:\Vald Data\<Athlete>\*.png`.
-
-> Session cache `auth_state.json` speeds up subsequent runs.
+* Toggle **headless**/watch mode by setting `HEADLESS = False` in the script.
+* You can tune waits/timeouts near the top of the file if your network is slow.
+* Login is cached in `auth_state.json` between runs.
 
 ---
 
-### (Optional) 2) Clean out test screenshots
+## 5) `cleanup_vald_images.py` — Remove first screenshots & empty folders
 
-Removes these **four** files from **every** athlete folder:
+This script does **two things**:
 
-* `Countermovement_Jump_001.png`
-* `20yd_Sprint_001.png`
-* `5-0-5_Drill_001.png`
-* `Nordic_001.png`
+1. **Delete these “test” first screenshots** from every athlete folder (if present):
 
-```powershell
+   * `Countermovement_Jump_001.png`
+   * `20yd_Sprint_001.png`
+   * `5-0-5_Drill_001.png`
+   * `Nordic_001.png`
+2. **Remove empty athlete folders** (and optionally empty team folders)
+
+### Usage
+
+```bash
+# Default root: D:\Vald Data
+python cleanup_vald_images.py
+
+# Choose a different root
 python cleanup_vald_images.py --root "D:\Vald Data"
+
+# Dry run (prints what would be removed, but does not delete)
+python cleanup_vald_images.py --dry-run
+
+# Only affect specific teams (exact names, comma-separated)
+python cleanup_vald_images.py --teams "KC Fusion 10G Navy,KC Fusion 12B Gold"
+
+# Also prune team folder if it ends up empty
+python cleanup_vald_images.py --prune-empty-teams
 ```
 
-> After this, each folder typically has **19 images** used for the analysis.
+The script prints counts for teams scanned, athlete folders checked, files deleted, and how many athlete/team folders were removed.
 
 ---
 
-### 3) Generate per-athlete analysis with ChatGPT (GPT-4o mini)
+## 6) `chatgpt_generate.py` — Build **Analysis.md** from images (OpenAI)
 
-```powershell
+Reads all PNGs for each athlete, sends them to an OpenAI vision model, and writes:
+
+```
+< Athlete Name > Analysis.md
+```
+
+into that athlete’s folder.
+
+### Team-aware traversal & console output
+
+* Walks **Base → Team → Athlete** and processes each athlete folder containing images.
+* For each athlete it prints: **team name, athlete name, and number of images used**.
+
+### Pacing / cooldowns
+
+* Strict pacing to avoid rate limits.
+* **After every 5 athletes**, the script **pauses 3 minutes** automatically.
+* Additional built-in per-request pacing is included.
+
+### Typical run
+
+```bash
 python chatgpt_generate.py
+# optional
+python chatgpt_generate.py --base-dir "D:\Vald Data"
 ```
 
-**Details**
+Key behavior:
 
-* Model: **gpt-4o-mini** (vision)
-* Cohort fixed at **11–16 years old female**
-* Sends **all images in the folder** (post-cleanup) in a **single request**
-* Output: `{Athlete} Analysis.md` in the athlete’s folder
-* Rate limit: **2 RPM**, with extra pacing + retries
-* Logs:
+* Skips an athlete if their `Analysis.md` already exists (configurable in the script).
+* Writes a CSV log and a `failed.txt` list in the base folder.
 
-  * `D:\Vald Data\run_log.csv`
-  * `D:\Vald Data\failed.txt`
-
-**Behavior**
-
-* Skips a folder if `{Athlete} Analysis.md` already exists (configurable in script).
-* Flexible: continues even if some images are missing.
+> Make sure `OPENAI_API_KEY` is set in `.env`.
 
 ---
 
-### 4) Generate 8-week training program with Grok → `.docx`
+## 7) `grok_generate.py` — Build **8-week program .docx** from Analysis.md (xAI)
 
-```powershell
+Reads:
+
+```
+< Athlete Name > Analysis.md
+```
+
+and writes:
+
+```
+< Athlete Name > 8 Weeks Training Program.docx
+```
+
+in the same athlete folder, using **xAI (Grok) via OpenAI-compatible API**.
+
+### Team-aware traversal
+
+* Walks **Base → Team → Athlete**
+* For each athlete, it looks for **exact** `"<Athlete> Analysis.md"` first,
+  otherwise falls back to the first `* Analysis.md`.
+
+### Run it
+
+```bash
 python grok_generate.py
+# or
+python grok_generate.py --base-dir "D:\Vald Data" --model grok-3-mini --rpm 2
 ```
 
-**Details**
+It logs to `run_grok_log.csv` and `failed_grok.txt` in the base directory.
 
-* Model: **grok-3-mini** (xAI, OpenAI-compatible API)
-* Reads `{Athlete} Analysis.md` as input context
-* Writes `{Athlete} 8 Weeks Training Program.docx` (no tables, structured headings)
-* Weekly plan grouped as **Weeks 1–2**, **Weeks 3–4**, **Weeks 5–6**, **Weeks 7–8**
-* Rate limit: **2 RPM**
-* Logs:
-
-  * `D:\Vald Data\run_grok_log.csv`
-  * `D:\Vald Data\failed_grok.txt`
-
-**CLI options**
-
-```powershell
-# Dry run (no API calls)
-python grok_generate.py --dry-run
-
-# Change base directory
-python grok_generate.py --base-dir "E:\AnotherRoot"
-
-# Change model / rate
-python grok_generate.py --model grok-3-mini --rpm 2
-```
+> Make sure `XAI_API_KEY` is set in `.env`.
 
 ---
 
-## 🔄 Change which **teams** are scraped (Fusion Soccer → yours)
+## 8) FAQ / Troubleshooting
 
-Open **`scrape_vald.py`** and find:
+**Q: Team A’s players show up when scraping Team B.**
+A: The scraper explicitly **clears** chips/selection and **re-ensures** the Profiles page before switching teams. If you still see this, increase delays:
 
-```python
-# ----- filter Fusion Soccer teams -----
-log("FILTER", "Selecting all 'Fusion Soccer' teams...")
-groups_dropdown = page.locator(
-    ".react-select__control", has_text="All Groups"
-).first
-expect(groups_dropdown).to_be_visible(timeout=15000)
-groups_dropdown.click()
-expect(page.locator(".react-select__menu")).to_be_visible(timeout=15000)
+* `page.wait_for_load_state("networkidle")` is already used after filter changes.
+* You can add a small extra pause after setting the filter.
 
-team_options = page.locator(".react-select__menu .react-select__option")
-fusion_teams = team_options.filter(has_text=re.compile(r"^Fusion Soccer"))
-names = [t.strip() for t in fusion_teams.all_inner_texts()]
-log("FILTER", f"Found {len(names)} teams.")
-for nm in names:
-    page.get_by_role("option", name=nm).click()
-    log("FILTER", f"Selected: {nm}")
-```
+**Q: Dropdown didn’t open / ‘Could not set filter to ONLY ...’.**
+A: The script scrolls to the top and uses robust selectors for the **react-select** menu. If your UI is slow, increase the dropdown timeout / retries in `open_groups_dropdown`.
 
-**Option A — Prefix filter**
-Change the regex to match your prefix:
+**Q: I want to watch what’s happening.**
+A: Set `HEADLESS = False` and optionally `slow_mo` in `scrape_vald.py` for slower, visible interactions.
 
-```python
-fusion_teams = team_options.filter(has_text=re.compile(r"^My Club"))
-```
+**Q: The site uses a cookie banner.**
+A: The scraper auto-accepts it (`#rcc-confirm-button`) when present.
 
-**Option B — Exact names**
-Replace the block with a fixed list:
-
-```python
-team_options = page.locator(".react-select__menu .react-select__option")
-desired = [
-    "My Club - 2010 Girls",
-    "My Club - 2012 Boys",
-]
-for nm in desired:
-    page.get_by_role("option", name=nm).click()
-    log("FILTER", f"Selected: {nm}")
-```
-
-> If your dropdown isn’t labeled **“All Groups”**, adjust:
->
-> ```python
-> groups_dropdown = page.locator(".react-select__control", has_text="All Groups").first
-> ```
->
-> Replace `"All Groups"` with your UI text.
+**Q: Where are my screenshots?**
+A: `D:\Vald Data\<Team>\<Athlete>\*.png` (configurable via `OUTPUT_DIR` or CLI in cleanup/generators).
 
 ---
 
-## 🗂 Script summary
+## 9) One-liners
 
-| Script                   | Purpose                                                                                     | Input                               | Output                                           |
-| ------------------------ | ------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------ |
-| `scrape_vald.py`         | Login, filter teams, open each athlete, screenshot all accordion sections + HumanTrak tiles | `.env` (EMAIL, PASSWORD)            | `D:\Vald Data\{Athlete}\*.png`                   |
-| `cleanup_vald_images.py` | Remove 4 test screenshots (`*_001.png`) from each folder                                    | `--root` (default `D:\Vald Data`)   | Folders trimmed to 19 images                     |
-| `chatgpt_generate.py`    | One analysis per athlete from all images using GPT-4o mini                                  | `.env` (OPENAI\_API\_KEY)           | `{Athlete} Analysis.md` + logs                   |
-| `grok_generate.py`       | 8-week training plan from the analysis with Grok 3 Mini                                     | `.env` (XAI\_API\_KEY), Analysis.md | `{Athlete} 8 Weeks Training Program.docx` + logs |
-
----
-
-## 🧪 Quick smoke test
-
-```powershell
-env\Scripts\activate
-python -m playwright install
-python scrape_vald.py
-python cleanup_vald_images.py --root "D:\Vald Data"
-python chatgpt_generate.py
-python grok_generate.py
-```
-
-Open an athlete folder and confirm:
-
-* 19 images
-* `{Athlete} Analysis.md`
-* `{Athlete} 8 Weeks Training Program.docx`
-
----
-
-## 🆘 Troubleshooting
-
-* **Login/session weirdness** → delete `auth_state.json` and re-run.
-* **Playwright missing** → `python -m playwright install` (inside your venv).
-* **Tooltip overlays in screenshots** → handled automatically (mouse moves off tile).
-* **No images found** → check that cleanup didn’t remove everything; scraper logs show what was captured.
-* **Rate limit / timeouts** → both generators use retries and pacing; reduce RPM or increase delays in code if needed.
-* **Missing analysis for Grok** → ensure `{Athlete} Analysis.md` exists in the folder.
-
----
-
-## ✅ TL;DR (commands)
-
-```powershell
-# One-time setup
-python -m venv env
-env\Scripts\activate
-pip install -r requirements.txt
-python -m playwright install
-
-# .env with EMAIL, PASSWORD, OPENAI_API_KEY, XAI_API_KEY
-
-# 1) Scrape
+```bash
+# Scrape (interactive team selection)
 python scrape_vald.py
 
-# 2) (Optional) Remove test screenshots
-python cleanup_vald_images.py --root "D:\Vald Data"
+# Clean first screenshots + remove empty athlete folders (dry run first)
+python cleanup_vald_images.py --dry-run
+python cleanup_vald_images.py --prune-empty-teams
 
-# 3) ChatGPT analysis (.md)
+# Generate Analysis.md from images (pauses 3 min after every 5 athletes)
 python chatgpt_generate.py
 
-# 4) Grok 8-week program (.docx)
+# Generate 8-week training program .docx from Analysis.md
 python grok_generate.py
 ```
 
+---
 
+**Tip:** Commit your scripts and a sample `.env.example` (without secrets) so future runs are plug-and-play.
