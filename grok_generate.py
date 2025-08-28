@@ -5,7 +5,7 @@ import csv
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from dotenv import load_dotenv
 
@@ -26,9 +26,9 @@ except Exception:
 
 
 # ------------------------- Config -------------------------
-DEFAULT_BASE_DIR = Path(r"D:/Vald Data")
-DEFAULT_MODEL = "grok-3-mini"  # per your choice
-DEFAULT_RPM = 2  # 2 requests per minute (1 every 30s)
+DEFAULT_BASE_DIR = Path(r"D:/Vald Data")  # Root: contains team folders
+DEFAULT_MODEL = "grok-3-mini"
+DEFAULT_RPM = 2  # 2 requests/minute (simple pacing)
 AGE_GROUP_TEXT = "11–16 years old female"
 
 LOG_CSV = "run_grok_log.csv"
@@ -64,6 +64,7 @@ def read_text(path: Path) -> str:
 
 
 def ensure_log_headers(log_path: Path) -> None:
+    # Keep previous column order for compatibility
     if not log_path.exists():
         with log_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -99,7 +100,6 @@ Don't make it too big. The training program should include at least:
 
 Use the following analysis (generated from the athlete's test images) as context
 to tailor the plan. If something is unclear, make sensible, coaching-appropriate assumptions. Don't create any table inside the training program, just plain text with headings. In the weekly plan, you are going to make Weeks 1-2, Weeks 3-4, Weeks 5-6, and Weeks 7-8 as a sub-heading. Do not put this sub-heading in bullet points .
-
 
 --- BEGIN ATHLETE ANALYSIS (Markdown) ---
 {analysis_md}
@@ -152,7 +152,6 @@ def markdown_to_docx(md_text: str, out_path: Path, title: Optional[str] = None) 
     # Optional title at the top
     if title:
         t = doc.add_heading(title, level=0)
-        # make title a bit smaller to fit Word defaults nicely
         for run in t.runs:
             run.font.size = Pt(16)
 
@@ -163,7 +162,6 @@ def markdown_to_docx(md_text: str, out_path: Path, title: Optional[str] = None) 
         # code fences
         if line.strip().startswith("```"):
             in_code_block = not in_code_block
-            # add a blank to separate visually
             doc.add_paragraph()
             continue
 
@@ -189,20 +187,14 @@ def markdown_to_docx(md_text: str, out_path: Path, title: Optional[str] = None) 
         # bullets
         if line.lstrip().startswith(("- ", "* ", "• ")):
             text = line.lstrip()[2:].strip() if len(line.lstrip()) >= 2 else ""
-            p = doc.add_paragraph(text, style="List Bullet")
+            doc.add_paragraph(text, style="List Bullet")
             continue
 
-        # numbered list
+        # numbered list (simple 1. 2. 3. detection)
         stripped = line.lstrip()
-        if (
-            stripped
-            and any(stripped[:1].isdigit() for _ in [0])
-            and any(
-                stripped.startswith(prefix)
-                for prefix in [f"{i}. " for i in range(1, 10)]
-            )
+        if any(
+            stripped.startswith(prefix) for prefix in [f"{i}. " for i in range(1, 10)]
         ):
-            # basic 1. 2. 3. detection (simple but works fine for these outputs)
             text = stripped[stripped.find(".") + 1 :].strip()
             doc.add_paragraph(text, style="List Number")
             continue
@@ -218,23 +210,49 @@ def markdown_to_docx(md_text: str, out_path: Path, title: Optional[str] = None) 
     doc.save(str(out_path))
 
 
+# ------------------------- Team/Athlete discovery -------------------------
+def list_team_dirs(base: Path) -> List[Path]:
+    """Team folders are direct subfolders of base (sorted)."""
+    teams = [p for p in base.iterdir() if p.is_dir()]
+    return sorted(teams, key=lambda p: p.name.lower())
+
+
+def list_athlete_dirs(team_dir: Path) -> List[Path]:
+    """Athlete folders are direct subfolders of a team folder (sorted)."""
+    athletes = [p for p in team_dir.iterdir() if p.is_dir()]
+    return sorted(athletes, key=lambda p: p.name.lower())
+
+
+def find_analysis_file(athlete_dir: Path, athlete_name: str) -> Optional[Path]:
+    """
+    Prefer the exact "{Athlete} Analysis.md". If not found, fall back to the first "* Analysis.md".
+    """
+    exact = athlete_dir / f"{athlete_name} Analysis.md"
+    if exact.exists():
+        return exact
+    # fallback: any "* Analysis.md"
+    candidates = sorted(athlete_dir.glob("* Analysis.md"))
+    return candidates[0] if candidates else None
+
+
 # ------------------------- Processing -------------------------
 def process_athlete_folder(
     client: OpenAI,
     model: str,
-    folder: Path,
+    team_name: str,
+    athlete_dir: Path,
     rl: RateLimiter,
     overwrite: bool = True,
 ) -> Tuple[bool, str]:
     """
     Returns (success, message). Writes the training program DOCX on success.
     """
-    athlete_name = folder.name.strip()
-    analysis_file = folder / f"{athlete_name} Analysis.md"
-    out_file = folder / f"{athlete_name} 8 Weeks Training Program.docx"
+    athlete_name = athlete_dir.name.strip()
+    analysis_file = find_analysis_file(athlete_dir, athlete_name)
+    out_file = athlete_dir / f"{athlete_name} 8 Weeks Training Program.docx"
 
-    if not analysis_file.exists():
-        return False, f"Analysis file not found: {analysis_file.name}"
+    if not analysis_file or not analysis_file.exists():
+        return False, f"Analysis file not found for athlete: {athlete_name}"
 
     try:
         analysis_md = read_text(analysis_file)
@@ -252,6 +270,9 @@ def process_athlete_folder(
         rl.stamp()
 
     # Write output as DOCX (overwrite by default)
+    if out_file.exists() and not overwrite:
+        return True, f"Exists (overwrite=False): {out_file.name}"
+
     try:
         markdown_to_docx(
             result_md,
@@ -273,12 +294,15 @@ def main():
         )
 
     parser = argparse.ArgumentParser(
-        description="Generate 8-week training programs with Grok for each athlete folder (DOCX output)."
+        description=(
+            "Generate 8-week training programs with Grok for each athlete folder under each team folder "
+            "(DOCX output). Scans: Base → Team → Athlete."
+        )
     )
     parser.add_argument(
         "--base-dir",
         default=str(DEFAULT_BASE_DIR),
-        help="Root directory that contains athlete folders (default: D:/Vald Data)",
+        help="Root directory that contains TEAM folders (default: D:/Vald Data)",
     )
     parser.add_argument(
         "--model",
@@ -302,8 +326,8 @@ def main():
         default=True,
         help="Overwrite existing training program files (default: True)",
     )
-
     args = parser.parse_args()
+
     base_dir = Path(args.base_dir)
     model = args.model
     rpm = max(1, args.rpm)
@@ -324,76 +348,117 @@ def main():
     # Rate limiter
     rl = RateLimiter(rpm=rpm)
 
-    # Walk athlete folders alphabetically
-    folders = [p for p in base_dir.iterdir() if p.is_dir()]
-    folders.sort(key=lambda p: p.name.lower())
+    # Discover teams & athletes
+    teams = list_team_dirs(base_dir)
+    total_teams = len(teams)
+    total_athletes = sum(len(list_athlete_dirs(t)) for t in teams)
 
-    total = len(folders)
-    print(f"[{now_iso()}] Found {total} athlete folders under: {base_dir}\n")
+    print(
+        f"[{now_iso()}] Scanning base: {base_dir}\n"
+        f" - Teams found: {total_teams}\n"
+        f" - Athlete folders (all teams): {total_athletes}\n"
+    )
 
-    for idx, folder in enumerate(folders, start=1):
-        athlete = folder.name
-        print(f"[{now_iso()}] ({idx}/{total}) Processing: {athlete}")
+    # Process by team, then athlete
+    team_idx = 0
+    processed_count = 0
 
-        analysis_file = folder / f"{athlete} Analysis.md"
-        out_file = folder / f"{athlete} 8 Weeks Training Program.docx"
+    for team in teams:
+        team_idx += 1
+        athletes = list_athlete_dirs(team)
+        print(
+            f"[{now_iso()}] Team {team_idx}/{total_teams}: {team.name} — Athletes: {len(athletes)}"
+        )
 
-        if not analysis_file.exists():
-            msg = f"SKIP - analysis file missing: {analysis_file.name}"
-            print("   ", msg)
-            append_log(
-                log_csv,
-                [now_iso(), athlete, str(folder), "missing-analysis", model, ""],
-            )
-            append_fail(fail_list, athlete, "analysis file missing")
-            continue
+        for a_idx, athlete_dir in enumerate(athletes, start=1):
+            athlete = athlete_dir.name
+            # Show which team & athlete we're processing
+            print(f"  [{now_iso()}] ({a_idx}/{len(athletes)}) {team.name} → {athlete}")
 
-        if dry_run:
-            print("   DRY RUN - would call Grok and write:", out_file.name)
-            append_log(
-                log_csv,
-                [now_iso(), athlete, str(folder), "dry-run", model, out_file.name],
-            )
-            continue
+            analysis_file = find_analysis_file(athlete_dir, athlete)
+            out_file = athlete_dir / f"{athlete} 8 Weeks Training Program.docx"
 
-        if out_file.exists() and not overwrite:
-            print("   SKIP - output exists and overwrite=False:", out_file.name)
-            append_log(
-                log_csv,
-                [
-                    now_iso(),
-                    athlete,
-                    str(folder),
-                    "skipped-exists",
-                    model,
-                    out_file.name,
-                ],
-            )
-            continue
-
-        try:
-            ok, msg = process_athlete_folder(
-                client, model, folder, rl, overwrite=overwrite
-            )
-            if ok:
-                print("   DONE ->", msg)
-                append_log(log_csv, [now_iso(), athlete, str(folder), "ok", model, msg])
-            else:
-                print("   FAIL ->", msg)
+            if not analysis_file or not analysis_file.exists():
+                msg = f"SKIP - analysis file missing for {athlete}"
+                print("     ", msg)
                 append_log(
-                    log_csv, [now_iso(), athlete, str(folder), "fail", model, ""]
+                    log_csv,
+                    [
+                        now_iso(),
+                        athlete,
+                        str(athlete_dir),
+                        "missing-analysis",
+                        model,
+                        "",
+                    ],
                 )
-                append_fail(fail_list, athlete, msg)
-        except Exception as e:
-            err = f"Unhandled error: {e}"
-            print("   ERROR ->", err)
-            append_log(log_csv, [now_iso(), athlete, str(folder), "error", model, ""])
-            append_fail(fail_list, athlete, err)
+                append_fail(fail_list, athlete, "analysis file missing")
+                continue
 
-        # Friendly spacing in console
+            if dry_run:
+                print("     DRY RUN - would call Grok and write:", out_file.name)
+                append_log(
+                    log_csv,
+                    [
+                        now_iso(),
+                        athlete,
+                        str(athlete_dir),
+                        "dry-run",
+                        model,
+                        out_file.name,
+                    ],
+                )
+                continue
+
+            if out_file.exists() and not overwrite:
+                print("     SKIP - output exists and overwrite=False:", out_file.name)
+                append_log(
+                    log_csv,
+                    [
+                        now_iso(),
+                        athlete,
+                        str(athlete_dir),
+                        "skipped-exists",
+                        model,
+                        out_file.name,
+                    ],
+                )
+                continue
+
+            try:
+                ok, msg = process_athlete_folder(
+                    client, model, team.name, athlete_dir, rl, overwrite=overwrite
+                )
+                if ok:
+                    print("     DONE ->", msg)
+                    append_log(
+                        log_csv,
+                        [now_iso(), athlete, str(athlete_dir), "ok", model, msg],
+                    )
+                else:
+                    print("     FAIL ->", msg)
+                    append_log(
+                        log_csv,
+                        [now_iso(), athlete, str(athlete_dir), "fail", model, ""],
+                    )
+                    append_fail(fail_list, athlete, msg)
+            except Exception as e:
+                err = f"Unhandled error: {e}"
+                print("     ERROR ->", err)
+                append_log(
+                    log_csv, [now_iso(), athlete, str(athlete_dir), "error", model, ""]
+                )
+                append_fail(fail_list, athlete, err)
+
+            processed_count += 1
+
+        # friendly spacing per team
         print()
 
-    print(f"[{now_iso()}] All done. Log: {log_csv.name} | Fail list: {fail_list.name}")
+    print(
+        f"[{now_iso()}] All done. Teams: {total_teams} | Athletes visited: {total_athletes} | "
+        f"Processed attempts: {processed_count} | Log: {log_csv.name} | Fail list: {fail_list.name}"
+    )
 
 
 if __name__ == "__main__":
