@@ -7,7 +7,7 @@ import sys
 import hashlib
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 from dotenv import load_dotenv
 from playwright.sync_api import (
@@ -22,8 +22,6 @@ from playwright.sync_api import (
 load_dotenv()  # .env in CWD
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
-if not EMAIL or not PASSWORD:
-    raise RuntimeError("EMAIL/PASSWORD must be set in .env")
 
 BASE_URL = "https://hub.valdperformance.com/"
 OUTPUT_DIR = Path(r"D:/Vald Data")
@@ -55,10 +53,20 @@ CHROME_ARGS = [
     "--overscroll-history-navigation=0",
 ]
 
+# Global logger callback
+LOGGER_CALLBACK: Optional[Callable[[str, str], None]] = None
+
+def set_logger_callback(callback: Optional[Callable[[str, str], None]]) -> None:
+    """Sets a global callback for logging."""
+    global LOGGER_CALLBACK
+    LOGGER_CALLBACK = callback
 
 # ===================== UTILS =====================
 def log(tag: str, msg: str) -> None:
-    print(f"{tag:<7}| {msg}")
+    if LOGGER_CALLBACK:
+        LOGGER_CALLBACK(tag, msg)
+    else:
+        print(f"{tag:<7}| {msg}")
 
 
 def sanitize_filename(name: str) -> str:
@@ -102,6 +110,10 @@ def ensure_profiles_page(page: Page) -> None:
 
 
 def perform_login(page: Page) -> bool:
+    if not EMAIL or not PASSWORD:
+        log("ERROR", "EMAIL/PASSWORD must be set in .env")
+        raise RuntimeError("EMAIL/PASSWORD must be set in .env")
+
     log("LOGIN", "Navigating...")
     page.goto(BASE_URL)
 
@@ -898,22 +910,29 @@ def clear_selected_team_via_cross(page: Page) -> None:
 
 # ===================== CLEANUP RUNNER =====================
 def run_cleanup():
-    script_path = Path(__file__).with_name("cleanup_vald_images.py")
-    if not script_path.exists():
-        log("CLEAN", "cleanup_vald_images.py not found; skipping.")
-        return
-    try:
-        log("CLEAN", f"Running {script_path.name}...")
-        subprocess.run(
-            [sys.executable, str(script_path)], cwd=str(script_path.parent), check=False
-        )
-        log("CLEAN", "Cleanup finished.")
-    except Exception as e:
-        log("CLEAN", f"Cleanup failed: {e}")
+    # This will be handled by the main application
+    pass
 
 
-# ===================== MAIN =====================
-def main():
+# ===================== MAIN LOGIC =====================
+def run_scraper(
+    team_selection_mode: str,
+    team_values: List[str],
+    output_dir: str,
+    headless: bool = True,
+    log_callback: Optional[Callable[[str, str], None]] = None,
+) -> bool:
+    """
+    Main scraping logic.
+    :param team_selection_mode: 'prefix' or 'list'.
+    :param team_values: List of team names or a prefix string.
+    :param headless: Whether to run the browser in headless mode.
+    :param log_callback: Callback for logging.
+    :return: True on success, False on failure.
+    """
+    if log_callback:
+        set_logger_callback(log_callback)
+
     browser = None
     context = None
     page: Optional[Page] = None
@@ -921,8 +940,8 @@ def main():
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=HEADLESS,
-                slow_mo=55 if not HEADLESS else 0,
+                headless=headless,
+                slow_mo=55 if not headless else 0,
                 args=CHROME_ARGS,
             )
 
@@ -945,8 +964,10 @@ def main():
                     log("SESS", "Session OK.")
                 except Exception:
                     log("SESS", "Session invalid. Re-authenticating...")
-                    context.close()
-                    os.remove(AUTH_FILE)
+                    if context:
+                        context.close()
+                    if os.path.exists(AUTH_FILE):
+                        os.remove(AUTH_FILE)
                     context = browser.new_context(
                         viewport={"width": WINDOW_W, "height": WINDOW_H},
                         device_scale_factor=DEVICE_SCALE,
@@ -955,7 +976,7 @@ def main():
                     page = context.new_page()
                     page.set_viewport_size({"width": WINDOW_W, "height": WINDOW_H})
                     if not perform_login(page):
-                        return
+                        return False
                     context.storage_state(path=AUTH_FILE)
             else:
                 context = browser.new_context(
@@ -966,24 +987,23 @@ def main():
                 page = context.new_page()
                 page.set_viewport_size({"width": WINDOW_W, "height": WINDOW_H})
                 if not perform_login(page):
-                    return
+                    return False
                 context.storage_state(path=AUTH_FILE)
 
             # ----- profiles page -----
             ensure_profiles_page(page)
 
-            # ----- interactive team selection -----
-            mode, values = prompt_team_mode()
-            if mode == "prefix":
-                prefix = values[0]
+            # ----- team selection -----
+            if team_selection_mode == "prefix":
+                prefix = team_values[0]
                 log("FILTER", f"Selecting teams by prefix: '{prefix}'")
                 teams = resolve_teams_by_prefix(page, prefix)
             else:
-                teams = values
+                teams = team_values
 
             log(
                 "FILTER",
-                f"{('Prefix=' + values[0]) if mode=='prefix' else 'Explicit list'} -> {len(teams)} teams resolved.",
+                f"{('Prefix=' + team_values[0]) if team_selection_mode=='prefix' else 'Explicit list'} -> {len(teams)} teams resolved.",
             )
 
             # Process one team at a time into team folder
@@ -996,7 +1016,7 @@ def main():
                 set_filter_to_single_team(page, team_name)
 
                 # Team-level output directory
-                team_dir = OUTPUT_DIR / sanitize_filename(team_name)
+                team_dir = Path(output_dir) / sanitize_filename(team_name)
                 team_dir.mkdir(parents=True, exist_ok=True)
 
                 # ----- table pagination for this team -----
@@ -1066,9 +1086,11 @@ def main():
                     log("FILTER", f"(warn) Could not clear via ×: {e}")
 
             log("DONE", "✅ All teams processed.")
+            return True
 
     except Exception as e:
         log("ERROR", f"Top-level error: {e}")
+        return False
     finally:
         try:
             if context:
@@ -1080,8 +1102,15 @@ def main():
                 browser.close()
         except Exception:
             pass
-        run_cleanup()
 
+def main():
+    # This is for standalone execution
+    if not EMAIL or not PASSWORD:
+        print("ERROR| EMAIL and PASSWORD must be set in a .env file.")
+        return
+
+    mode, values = prompt_team_mode()
+    run_scraper(mode, values, headless=HEADLESS)
 
 if __name__ == "__main__":
     main()

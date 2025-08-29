@@ -1,32 +1,10 @@
 """
 Remove specific "test" screenshots and prune empty athlete/team folders.
-
-Primary structure:
-  D:/Vald Data/<Team Name>/<Athlete Name>/
-
-Back-compat (optional auto-scan):
-  D:/Vald Data/<Athlete Name>/   (if it directly contains images)
-
-Deletes ONLY these files inside each athlete folder, if present:
-- Countermovement_Jump_001.png
-- 20yd_Sprint_001.png
-- 5-0-5_Drill_001.png
-- Nordic_001.png
-
-Then removes the athlete folder if it is COMPLETELY EMPTY (no files/subfolders).
-Optionally remove the team folder too if it becomes empty (--prune-empty-teams).
-
-Usage:
-  python cleanup_vald_images.py
-  python cleanup_vald_images.py --root "D:\\Vald Data"
-  python cleanup_vald_images.py --dry-run
-  python cleanup_vald_images.py --teams "KC Fusion 10G Navy,KC Fusion 12B Gold"
-  python cleanup_vald_images.py --prune-empty-teams
 """
 
 from pathlib import Path
 import argparse
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Callable
 import os
 
 TARGET_FILENAMES = [
@@ -38,6 +16,19 @@ TARGET_FILENAMES = [
 
 VALID_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
+# Global logger callback
+LOGGER_CALLBACK: Optional[Callable[[str, str], None]] = None
+
+def set_logger_callback(callback: Optional[Callable[[str, str], None]]) -> None:
+    """Sets a global callback for logging."""
+    global LOGGER_CALLBACK
+    LOGGER_CALLBACK = callback
+
+def log(tag: str, msg: str) -> None:
+    if LOGGER_CALLBACK:
+        LOGGER_CALLBACK(tag, msg)
+    else:
+        print(f"[{tag.upper()}] {msg}")
 
 def iter_team_dirs(root: Path) -> Iterable[Path]:
     """Yield team directories directly under the root."""
@@ -70,15 +61,15 @@ def delete_targets_in_athlete_dir(athlete_dir: Path, dry_run: bool = False) -> i
         try:
             if path.exists():
                 if dry_run:
-                    print(f"[DRY] Would delete: {path}")
+                    log("dry", f"Would delete: {path}")
                 else:
                     path.unlink()
-                    print(f"[DEL] {path}")
+                    log("del", f"{path}")
                 deleted_here += 1
         except PermissionError:
-            print(f"[SKIP] Permission denied: {path}")
+            log("skip", f"Permission denied: {path}")
         except Exception as e:
-            print(f"[SKIP] {path} -> {e}")
+            log("skip", f"{path} -> {e}")
     return deleted_here
 
 
@@ -94,13 +85,20 @@ def folder_directly_contains_images(folder: Path) -> bool:
     return False
 
 
-def cleanup_team_tree(
-    root: Path, teams_filter: List[str], dry_run: bool, prune_empty_teams: bool
-) -> None:
+def run_cleanup(
+    root: Path,
+    teams_filter: List[str],
+    dry_run: bool,
+    prune_empty_teams: bool,
+    log_callback: Optional[Callable[[str, str], None]] = None,
+) -> bool:
     """Scan root/team/athlete and remove target files + prune empty folders."""
+    if log_callback:
+        set_logger_callback(log_callback)
+
     if not root.exists() or not root.is_dir():
-        print(f"[ERR] Root does not exist or is not a directory: {root}")
-        return
+        log("err", f"Root does not exist or is not a directory: {root}")
+        return False
 
     teams_filter_norm = (
         {t.strip().lower() for t in teams_filter if t.strip()}
@@ -117,62 +115,54 @@ def cleanup_team_tree(
     # ---------- Team -> Athlete structure ----------
     for team_dir in iter_team_dirs(root):
         team_name = team_dir.name
-        # Treat directories that obviously look like athlete folders (contain images directly) as back-compat; skip here
-        # They will be handled in the back-compat pass below.
         if folder_directly_contains_images(team_dir):
             continue
 
         if teams_filter_norm and team_name.lower() not in teams_filter_norm:
             continue
 
-        print(f"\n[TEAM] {team_name}")
+        log("team", f"{team_name}")
         teams_seen += 1
 
         for athlete_dir in iter_athlete_dirs(team_dir):
             athletes_seen += 1
-
-            # 1) Delete target files
             files_deleted += delete_targets_in_athlete_dir(athlete_dir, dry_run=dry_run)
-
-            # 2) If now empty, remove athlete folder
             try:
                 if is_dir_completely_empty(athlete_dir):
                     if dry_run:
-                        print(f"[DRY] Would remove empty athlete folder: {athlete_dir}")
+                        log("dry", f"Would remove empty athlete folder: {athlete_dir}")
                     else:
                         athlete_dir.rmdir()
-                        print(f"[DEL] {athlete_dir}")
+                        log("del", f"{athlete_dir}")
                     athlete_dirs_removed += 1
                 else:
-                    print(f"[KEEP] {athlete_dir} (not empty)")
+                    log("keep", f"{athlete_dir} (not empty)")
             except PermissionError:
-                print(f"[SKIP] Permission denied: {athlete_dir}")
+                log("skip", f"Permission denied: {athlete_dir}")
             except Exception as e:
-                print(f"[SKIP] {athlete_dir} -> {e}")
+                log("skip", f"{athlete_dir} -> {e}")
 
-        # 3) Optionally prune team folder if it became empty
         if prune_empty_teams:
             try:
                 if is_dir_completely_empty(team_dir):
                     if dry_run:
-                        print(f"[DRY] Would remove empty team folder: {team_dir}")
+                        log("dry", f"Would remove empty team folder: {team_dir}")
                     else:
                         team_dir.rmdir()
-                        print(f"[DEL] {team_dir}")
+                        log("del", f"{team_dir}")
                     team_dirs_removed += 1
             except PermissionError:
-                print(f"[SKIP] Permission denied (team): {team_dir}")
+                log("skip", f"Permission denied (team): {team_dir}")
             except Exception as e:
-                print(f"[SKIP] {team_dir} -> {e}")
+                log("skip", f"{team_dir} -> {e}")
 
     # ---------- Back-compat: athletes directly under root ----------
-    # Only folders with images are treated as athlete folders here.
     direct_athletes = [
         p for p in root.iterdir() if p.is_dir() and folder_directly_contains_images(p)
     ]
     if direct_athletes:
-        print(
-            "\n[INFO] Also scanning athlete folders directly under root (back-compat)."
+        log(
+            "info", "Also scanning athlete folders directly under root (back-compat)."
         )
     for athlete_dir in direct_athletes:
         athletes_seen += 1
@@ -180,21 +170,21 @@ def cleanup_team_tree(
         try:
             if is_dir_completely_empty(athlete_dir):
                 if dry_run:
-                    print(f"[DRY] Would remove empty athlete folder: {athlete_dir}")
+                    log("dry", f"Would remove empty athlete folder: {athlete_dir}")
                 else:
                     athlete_dir.rmdir()
-                    print(f"[DEL] {athlete_dir}")
+                    log("del", f"{athlete_dir}")
                 athlete_dirs_removed += 1
             else:
-                print(f"[KEEP] {athlete_dir} (not empty)")
+                log("keep", f"{athlete_dir} (not empty)")
         except PermissionError:
-            print(f"[SKIP] Permission denied: {athlete_dir}")
+            log("skip", f"Permission denied: {athlete_dir}")
         except Exception as e:
-            print(f"[SKIP] {athlete_dir} -> {e}")
+            log("skip", f"{athlete_dir} -> {e}")
 
     # ---------- Summary ----------
-    print(
-        f"\nDone. Teams scanned: {teams_seen} | Athlete folders checked: {athletes_seen} | "
+    summary_msg = (
+        f"Teams scanned: {teams_seen} | Athlete folders checked: {athletes_seen} | "
         f"Files {'to be deleted' if dry_run else 'deleted'}: {files_deleted} | "
         f"Athlete folders {'to be removed' if dry_run else 'removed'}: {athlete_dirs_removed}"
         + (
@@ -203,6 +193,8 @@ def cleanup_team_tree(
             else ""
         )
     )
+    log("info", summary_msg)
+    return True
 
 
 def main():
@@ -234,7 +226,7 @@ def main():
     args = parser.parse_args()
 
     teams_filter = [t.strip() for t in args.teams.split(",")] if args.teams else []
-    cleanup_team_tree(
+    run_cleanup(
         Path(args.root),
         teams_filter=teams_filter,
         dry_run=args.dry_run,
