@@ -142,23 +142,9 @@ def perform_login(page: Page) -> bool:
         return False
 
 
-# ===================== TILE SELECTORS =====================
-def tile_forcedecks_by_name(page: Page, name: str) -> Locator:
-    return page.locator(
-        f'article:has([data-testid="forcedecks-tile"][data-test-name="{name}"])'
-    ).first
-
-
+# ===================== GENERIC TILE HELPERS =====================
 def tiles_by_testid(page: Page, testid: str) -> Locator:
     return page.locator(f'article:has([data-testid="{testid}"])')
-
-
-def tile_humantrak_by_title(page: Page, title_text: str) -> Locator:
-    return (
-        page.locator('article:has([data-testid="humantrak-tile"])')
-        .filter(has=page.locator(".truncate.font-medium", has_text=title_text))
-        .first
-    )
 
 
 def tile_by_heading_fallback(page: Page, title_text: str) -> Locator:
@@ -174,6 +160,195 @@ def get_tile_heading_text(tile: Locator) -> str:
     return heading.inner_text().strip() if heading.count() else ""
 
 
+# ===================== CMJ: ROBUST FIND & OPEN =====================
+def _scan_for_visibility(
+    page: Page, cand: Locator, steps: int = 7, pause_ms: int = 280
+) -> Optional[Locator]:
+    """
+    Scroll-scan the page to trigger lazy tiles and return the first visible match if found.
+    """
+    try:
+        page.evaluate("window.scrollTo(0,0)")
+    except Exception:
+        pass
+    page.wait_for_timeout(120)
+    for _ in range(max(1, steps)):
+        try:
+            if cand.count() > 0 and cand.first.is_visible():
+                return cand.first
+        except Exception:
+            pass
+        try:
+            page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight*0.90))")
+        except Exception:
+            pass
+        page.wait_for_timeout(pause_ms)
+    # final check after returning to top
+    try:
+        page.evaluate("window.scrollTo(0,0)")
+    except Exception:
+        pass
+    page.wait_for_timeout(120)
+    try:
+        if cand.count() > 0 and cand.first.is_visible():
+            return cand.first
+    except Exception:
+        pass
+    return None
+
+
+def find_countermovement_jump_tile(page: Page) -> Optional[Locator]:
+    """
+    Heavily guarded discovery for the ForceDecks 'Countermovement Jump' tile.
+    Tries multiple selector strategies + scroll scan.
+    Returns a Locator (visible article) or None if not found.
+    """
+    reset_zoom(page)
+    pattern = re.compile(r"(counter\s*movement\s*jump|^cmj$|cmj\b)", re.I)
+
+    # PASS A: Original strict attribute selector
+    passes = [
+        lambda: page.locator(
+            'article:has([data-testid="forcedecks-tile"][data-test-name="Countermovement Jump"])'
+        ),
+        # PASS B: forcedecks-tile + heading regex
+        lambda: page.locator('article:has([data-testid="forcedecks-tile"])').filter(
+            has=page.locator(".truncate.font-medium", has_text=pattern)
+        ),
+        # PASS C: any forcedecks* + heading regex
+        lambda: page.locator('article:has([data-testid*="forcedecks"])').filter(
+            has=page.locator(".truncate.font-medium", has_text=pattern)
+        ),
+        # PASS D: any article heading match
+        lambda: page.locator("article").filter(
+            has=page.locator(".truncate.font-medium", has_text=pattern)
+        ),
+    ]
+
+    for pi, make_locator in enumerate(passes, start=1):
+        try:
+            cand = make_locator()
+        except Exception:
+            cand = None
+        if not cand:
+            continue
+        vis = _scan_for_visibility(page, cand)
+        if vis:
+            log(
+                "CMJ",
+                f"Found tile via PASS {pi}. Heading='{get_tile_heading_text(vis)}'",
+            )
+            return vis
+
+    log("CMJ", "Tile not found by any strategy (may be absent for this athlete).")
+    return None
+
+
+def _real_modal_locator(page: Page) -> Locator:
+    close_btn = page.locator('[data-testid="close-button"]').first
+    if close_btn.count() > 0:
+        return close_btn.locator(
+            "xpath=ancestor::div[contains(@class,'react-responsive-modal') or contains(@class,'fd-chart-modal') or @id='fd-chart-modal']"
+        ).first
+    return page.locator(
+        "#fd-chart-modal, .fd-chart-modal, .react-responsive-modal-modal"
+    ).first
+
+
+def open_modal_from_tile(
+    page: Page, tile: Locator, inner_selectors: List[str]
+) -> Locator:
+    """
+    Open a modal by clicking a tile using several strategies. Returns the modal locator.
+    """
+    expect(tile).to_be_visible(timeout=20000)
+    tile.scroll_into_view_if_needed()
+
+    def _try_open(click_fn_desc: str, click_fn):
+        try:
+            click_fn()
+        except Exception:
+            return False
+        modal = _real_modal_locator(page)
+        try:
+            expect(modal).to_be_visible(timeout=3000)
+            page.wait_for_timeout(MODAL_MOUNT_WAIT)
+            reset_zoom(page)
+            log("MODAL", f"Opened via {click_fn_desc}.")
+            return modal
+        except Exception:
+            return False
+
+    # 1) click tile center / top-left
+    for desc, fn in [
+        ("article center", lambda: tile.click()),
+        ("article top-left", lambda: tile.click(position={"x": 18, "y": 18})),
+    ]:
+        modal = _try_open(desc, fn)
+        if modal:
+            return modal
+
+    # 2) click inner candidates
+    for sel in inner_selectors:
+        inner = tile.locator(sel).first
+        if inner.count() == 0:
+            continue
+        for desc, fn in [
+            (f'inner "{sel}" center', lambda i=inner: i.click()),
+            (
+                f'inner "{sel}" top-left',
+                lambda i=inner: i.click(position={"x": 10, "y": 10}),
+            ),
+        ]:
+            modal = _try_open(desc, fn)
+            if modal:
+                return modal
+
+    # 3) click heading
+    heading = tile.locator(".truncate.font-medium").first
+    if heading.count() > 0:
+        modal = _try_open("heading click", lambda: heading.click())
+        if modal:
+            return modal
+
+    # 4) keyboard Enter
+    try:
+        tile.focus()
+        page.keyboard.press("Enter")
+        modal = _real_modal_locator(page)
+        expect(modal).to_be_visible(timeout=3000)
+        page.wait_for_timeout(MODAL_MOUNT_WAIT)
+        reset_zoom(page)
+        log("MODAL", "Opened via Enter.")
+        return modal
+    except Exception:
+        pass
+
+    raise RuntimeError("Could not open modal from tile (after multiple strategies).")
+
+
+def open_modal_countermovement_jump(page: Page) -> Locator:
+    """
+    Robust opener for CMJ. Finds the tile with multiple strategies, then opens the modal
+    with multiple click fallbacks.
+    """
+    tile = find_countermovement_jump_tile(page)
+    if tile is None:
+        raise RuntimeError("CMJ tile not present or not discoverable.")
+
+    # Inner clickable selectors to try within the tile
+    inner_candidates = [
+        '[data-testid="forcedecks-tile"]',
+        '[data-testid*="forcedecks"]',
+        "canvas",
+        "svg",
+    ]
+    modal = open_modal_from_tile(page, tile, inner_candidates)
+    log("MODAL", "'Countermovement Jump' visible.")
+    return modal
+
+
+# ===================== OTHER TILES (SMARTSPEED / HUMANTRAK) =====================
 def find_smartspeed_tile_by_title(page: Page, desired_title: str) -> Locator:
     tiles = tiles_by_testid(page, "smartspeed-tile")
     count = tiles.count()
@@ -206,32 +381,6 @@ def find_smartspeed_tile_by_title(page: Page, desired_title: str) -> Locator:
     return tiles.first
 
 
-# ===================== MODALS =====================
-def _real_modal_locator(page: Page) -> Locator:
-    close_btn = page.locator('[data-testid="close-button"]').first
-    if close_btn.count() > 0:
-        return close_btn.locator(
-            "xpath=ancestor::div[contains(@class,'react-responsive-modal') or contains(@class,'fd-chart-modal') or @id='fd-chart-modal']"
-        ).first
-    return page.locator(
-        "#fd-chart-modal, .fd-chart-modal, .react-responsive-modal-modal"
-    ).first
-
-
-def open_modal_forcedecks_by_name(page: Page, name: str) -> Locator:
-    log("MODAL", f"Open '{name}'...")
-    tile = tile_forcedecks_by_name(page, name)
-    expect(tile).to_be_visible(timeout=20000)
-    tile.scroll_into_view_if_needed()
-    tile.click()
-    modal = _real_modal_locator(page)
-    expect(modal).to_be_visible(timeout=30000)
-    page.wait_for_timeout(MODAL_MOUNT_WAIT)
-    reset_zoom(page)
-    log("MODAL", f"'{name}' visible.")
-    return modal
-
-
 def open_modal_by_testid(
     page: Page, testid: str, title_hint: Optional[str] = None
 ) -> Locator:
@@ -240,133 +389,239 @@ def open_modal_by_testid(
     else:
         tile = tiles_by_testid(page, testid).first
 
-    expect(tile).to_be_visible(timeout=20000)
-    tile.scroll_into_view_if_needed()
-
-    inner = tile.locator(f'[data-testid="{testid}"]').first
-    heading = tile.locator(".truncate.font-medium").first
-
-    attempts = [
-        ("article center", lambda: tile.click()),
-        ("article top-left", lambda: tile.click(position={"x": 18, "y": 18})),
-        ("inner center", lambda: inner.click()),
-        ("inner top-left", lambda: inner.click(position={"x": 18, "y": 18})),
-        ("heading click", lambda: heading.click()),
-    ]
-    for label, fn in attempts:
-        try:
-            fn()
-        except Exception:
-            pass
-        modal = _real_modal_locator(page)
-        try:
-            expect(modal).to_be_visible(timeout=3000)
-            page.wait_for_timeout(MODAL_MOUNT_WAIT)
-            reset_zoom(page)
-            log("MODAL", f"Opened via {label}.")
-            return modal
-        except Exception:
-            pass
-
-    # Keyboard nudge
-    try:
-        tile.focus()
-        page.keyboard.press("Enter")
-        modal = _real_modal_locator(page)
-        expect(modal).to_be_visible(timeout=3000)
-        page.wait_for_timeout(MODAL_MOUNT_WAIT)
-        reset_zoom(page)
-        log("MODAL", "Opened via Enter.")
-        return modal
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Could not open modal testid={testid} (after tries).")
+    # Open with same robust click routine
+    return open_modal_from_tile(
+        page,
+        tile,
+        inner_selectors=[
+            f'[data-testid="{testid}"]',
+            f'[data-testid*="{testid.split("-")[0]}"]',
+        ],
+    )
 
 
-def close_modal(page: Page, modal: Locator) -> None:
-    log("MODAL", "Closing...")
-    btn = modal.locator(
-        '[data-testid="close-button"], button[aria-label="Close"]'
-    ).first
-    if btn.count() > 0 and btn.is_visible():
-        btn.click()
-    else:
-        page.mouse.click(10, 10)
-    try:
-        expect(modal).not_to_be_visible(timeout=10000)
-        log("MODAL", "Closed.")
-    except Exception:
-        log("MODAL", "Close check timed-out; continuing.")
+def tile_humantrak_by_title(page: Page, title_text: str) -> Locator:
+    return (
+        page.locator('article:has([data-testid="humantrak-tile"])')
+        .filter(has=page.locator(".truncate.font-medium", has_text=title_text))
+        .first
+    )
 
 
-# ===================== SCREENSHOTS & DEDUP =====================
-def _shot_bytes(locator: Locator) -> bytes:
-    """Return PNG bytes of the locator for hashing/write-after-unique."""
-    locator.scroll_into_view_if_needed()
-    time.sleep(0.15)
-    return locator.screenshot()  # returns bytes
-
-
-def _write_png(path: Path, data: bytes) -> None:
-    path.write_bytes(data)
-
-
-def screenshot_tile(
-    tile: Locator, save_dir: Path, prefix: str, counters: defaultdict
-) -> None:
-    """Direct file write (used for modals & base shots)."""
-    expect(tile).to_be_visible(timeout=15000)
-    counters[prefix] += 1
-    idx = counters[prefix]
-    path = save_dir / f"{prefix}_{idx:03d}.png"
-    data = _shot_bytes(tile)
-    _write_png(path, data)
-    log("SHOT", path.name)
-
-
-def screenshot_tile_unique(
-    tile: Locator,
+def capture_humantrak_card(
+    page: Page,
+    title: str,
+    labels_to_capture: List[str],
     save_dir: Path,
-    prefix: str,
     counters: defaultdict,
-    seen_hashes: set,
-    max_dupe_retries: int = 2,
-) -> bool:
+    include_base: bool = False,  # False -> exactly one shot per label
+) -> int:
     """
-    Capture a screenshot; if it duplicates a previous image for this tile prefix, retry a few times.
-    Returns True if a new file was written, False otherwise.
+    Take exactly one screenshot per requested metric label (and optionally one base shot).
+    Uses robust selection + pixel fingerprinting + bytes hashing + bounce strategy
+    to avoid duplicates when the list reorders itself or re-renders slowly.
     """
-    for attempt in range(max_dupe_retries + 1):
-        data = _shot_bytes(tile)
-        digest = hashlib.sha256(data).hexdigest()
-        if digest in seen_hashes:
-            log(
-                "SHOT",
-                f"Duplicate detected for {prefix} (attempt {attempt+1}/{max_dupe_retries}); retrying...",
-            )
-            # small jiggle/settle to encourage re-render stability
-            page = tile.page
+    tile = tile_humantrak_by_title(page, title)
+    if tile.count() == 0 or not tile.is_visible():
+        tile = tile_by_heading_fallback(page, title)
+    expect(tile).to_be_visible(timeout=15000)
+
+    def _get_chart_locator(t: Locator) -> Locator:
+        canvas = t.locator("canvas").first
+        if canvas.count() > 0:
+            return canvas
+        svg = t.locator(".recharts-wrapper svg, svg").first
+        if svg.count() > 0:
+            return svg
+        wrapper = t.locator(".recharts-wrapper").first
+        if wrapper.count() > 0:
+            return wrapper
+        return t
+
+    def _fingerprint(l: Locator) -> str:
+        data = l.screenshot()
+        return hashlib.sha256(data).hexdigest()
+
+    def _open_metric_menu(t: Locator, attempts: int = 4) -> Locator:
+        page = t.page
+        btn = t.locator('[data-testid="metric-dropdown-button"]').first
+        expect(btn).to_be_visible(timeout=12000)
+        btn.scroll_into_view_if_needed()
+
+        for _ in range(attempts):
             try:
-                tile.scroll_into_view_if_needed()
-                page.wait_for_timeout(250)
-                move_mouse_off_view(page)
+                btn.click()
             except Exception:
                 pass
+            menu = t.locator('[data-testid="metric-dropdown-items"]').first
+            try:
+                expect(menu).to_be_visible(timeout=2500)
+                return menu
+            except Exception:
+                page.wait_for_timeout(250)
+
+        btn.click(position={"x": 10, "y": 10})
+        menu = t.locator('[data-testid="metric-dropdown-items"]').first
+        expect(menu).to_be_visible(timeout=2500)
+        return menu
+
+    def select_metric_and_wait(label: str, timeout_ms: int = 10000) -> None:
+        token = (
+            "Ankle Dorsiflexion"
+            if "Ankle Dorsiflexion" in label
+            else (
+                "Hip Adduction"
+                if "Hip Adduction" in label
+                else "Peak Knee Flexion" if "Peak Knee Flexion" in label else label[:24]
+            )
+        )
+
+        chart_before = _get_chart_locator(tile)
+        fp_before = _fingerprint(chart_before)
+
+        menu = _open_metric_menu(tile)
+        option = menu.get_by_role(
+            "menuitem", name=re.compile(rf"^{re.escape(label)}\s*$")
+        )
+        expect(option.first).to_be_visible(timeout=8000)
+        option.first.scroll_into_view_if_needed()
+        option.first.click(force=True)
+
+        try:
+            expect(menu).not_to_be_visible(timeout=3000)
+        except Exception:
+            pass
+
+        btn = tile.locator('[data-testid="metric-dropdown-button"]').first
+        span = btn.locator("span.truncate").first
+        try:
+            expect(span).to_contain_text(
+                re.compile(re.escape(token), re.I), timeout=timeout_ms
+            )
+        except Exception:
+            page.wait_for_timeout(800)
+            expect(span).to_contain_text(
+                re.compile(re.escape(token), re.I), timeout=3000
+            )
+
+        deadline = time.time() + (timeout_ms / 1000.0)
+        while time.time() < deadline:
+            chart_after = _get_chart_locator(tile)
+            try:
+                fp_after = _fingerprint(chart_after)
+                if fp_after != fp_before:
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(150)
+        page.wait_for_timeout(MENU_AFTER_SELECT)
+
+    def screenshot_tile_unique(
+        t: Locator, prefix: str, seen_hashes: set, max_dupe_retries: int = 2
+    ) -> bool:
+        for attempt in range(max_dupe_retries + 1):
+            t.scroll_into_view_if_needed()
+            time.sleep(0.15)
+            data = t.screenshot()
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen_hashes:
+                log(
+                    "SHOT",
+                    f"Duplicate detected for {prefix} (attempt {attempt+1}/{max_dupe_retries}); retrying...",
+                )
+                try:
+                    t.scroll_into_view_if_needed()
+                    page.wait_for_timeout(250)
+                    move_mouse_off_view(page)
+                except Exception:
+                    pass
+                continue
+            counters[prefix] += 1
+            idx = counters[prefix]
+            path = save_dir / f"{prefix}_{idx:03d}.png"
+            path.write_bytes(data)
+            log("SHOT", path.name)
+            seen_hashes.add(digest)
+            return True
+        return False
+
+    taken = 0
+    seen_hashes: set = set()
+    prefix = title.replace(" ", "_")
+
+    if include_base:
+        log("CARD", f"{title}: base screenshot")
+        move_mouse_off_view(page)
+        if screenshot_tile_unique(tile, prefix, seen_hashes):
+            taken += 1
+
+    for label in labels_to_capture:
+        success = False
+        for attempt in range(1, 4):
+            try:
+                log("CARD", f"{title}: selecting '{label}' (attempt {attempt}/3)")
+                select_metric_and_wait(label)
+                move_mouse_off_view(page)
+                if screenshot_tile_unique(tile, prefix, seen_hashes):
+                    success = True
+                    taken += 1
+                    break
+                else:
+                    # bounce strategy
+                    alts = [x for x in labels_to_capture if x != label]
+                    if alts:
+                        try:
+                            select_metric_and_wait(alts[0])
+                            page.wait_for_timeout(400)
+                            select_metric_and_wait(label)
+                            move_mouse_off_view(page)
+                        except Exception:
+                            pass
+            except Exception as e:
+                log("CARD", f"(retry) '{title}' -> '{label}' failed: {e}")
+                page.wait_for_timeout(600)
+
+        if not success:
+            log(
+                "CARD",
+                f"(skip) '{title}' -> '{label}' produced duplicate/failed after retries.",
+            )
+
+    log("CARD", f"{title}: done ({taken} shots)")
+    return taken
+
+
+def capture_humantrak_card_any(
+    page: Page,
+    title_candidates: List[str],
+    labels_to_capture: List[str],
+    save_dir: Path,
+    counters: defaultdict,
+    include_base: bool = False,
+) -> int:
+    """
+    Try multiple title variants (e.g., 'Lunge' vs 'Lunges') and capture on the first that exists.
+    """
+    last_err = None
+    for title in title_candidates:
+        try:
+            return capture_humantrak_card(
+                page, title, labels_to_capture, save_dir, counters, include_base
+            )
+        except Exception as e:
+            last_err = e
             continue
-        # unique -> write
-        counters[prefix] += 1
-        idx = counters[prefix]
-        path = save_dir / f"{prefix}_{idx:03d}.png"
-        _write_png(path, data)
-        seen_hashes.add(digest)
-        log("SHOT", path.name)
-        return True
-    return False
+    if last_err:
+        raise last_err
+    return 0
 
 
-def _preload_modal_content(modal: Locator) -> None:
-    """Gently scroll the modal top->bottom to trigger lazy blocks, then back up."""
+# ===================== SCREENSHOTS & ACCORDIONS (shared) =====================
+def screenshot_modal_accordions(
+    page: Page, modal: Locator, save_dir: Path, prefix: str, counters: defaultdict
+) -> int:
+    """Screenshot each accordion section; if none, take one full-modal shot."""
+    # Preload by gentle scroll
     try:
         modal.evaluate("e => { e.scrollTop = 0; }")
         for y in (0.2, 0.4, 0.6, 0.8, 1.0):
@@ -377,41 +632,37 @@ def _preload_modal_content(modal: Locator) -> None:
     except Exception:
         pass
 
-
-def _wait_for_accordion_count_to_settle(
-    modal: Locator,
-    max_wait_ms: int = ACCORDION_DISCOVERY_TIMEOUT,
-    stable_for_ms: int = ACCORDION_STABLE_FOR_MS,
-    interval_ms: int = ACCORDION_CHECK_INTERVAL,
-) -> int:
-    """Wait until the number of div.accordion stops changing for `stable_for_ms`."""
-    elapsed = 0
-    stable = 0
-    prev = -1
-    while elapsed < max_wait_ms:
-        cnt = modal.locator("div.accordion").count()
-        if cnt == prev and cnt > 0:
-            stable += interval_ms
-            if stable >= stable_for_ms:
-                return cnt
-        else:
-            prev = cnt
-            stable = 0
-        modal.page.wait_for_timeout(interval_ms)
-        elapsed += interval_ms
-    return modal.locator("div.accordion").count()
-
-
-def screenshot_modal_accordions(
-    page: Page, modal: Locator, save_dir: Path, prefix: str, counters: defaultdict
-) -> int:
-    """Screenshot each accordion section; if none, take one full-modal shot."""
-    _preload_modal_content(modal)
+    # Wait for stable accordion count
+    def _wait_for_accordion_count_to_settle(
+        md: Locator,
+        max_wait_ms: int = ACCORDION_DISCOVERY_TIMEOUT,
+        stable_for_ms: int = ACCORDION_STABLE_FOR_MS,
+        interval_ms: int = ACCORDION_CHECK_INTERVAL,
+    ) -> int:
+        elapsed = 0
+        stable = 0
+        prev = -1
+        while elapsed < max_wait_ms:
+            cnt = md.locator("div.accordion").count()
+            if cnt == prev and cnt > 0:
+                stable += interval_ms
+                if stable >= stable_for_ms:
+                    return cnt
+            else:
+                prev = cnt
+                stable = 0
+            md.page.wait_for_timeout(interval_ms)
+            elapsed += interval_ms
+        return md.locator("div.accordion").count()
 
     cnt = _wait_for_accordion_count_to_settle(modal)
     if cnt == 0:
         log("MODAL", "No accordions detected; taking single modal shot as fallback.")
-        screenshot_tile(modal, save_dir, prefix, counters)
+        expect(modal).to_be_visible(timeout=15000)
+        counters[prefix] += 1
+        path = save_dir / f"{prefix}_{counters[prefix]:03d}.png"
+        path.write_bytes(modal.screenshot())
+        log("SHOT", path.name)
         return 1
 
     accordions = modal.locator("div.accordion")
@@ -439,10 +690,8 @@ def screenshot_modal_accordions(
             page.wait_for_timeout(ACCORDION_SECTION_SETTLE_MS)
 
             counters[prefix] += 1
-            idx = counters[prefix]
-            path = save_dir / f"{prefix}_{idx:03d}.png"
-            data = _shot_bytes(section)
-            _write_png(path, data)
+            path = save_dir / f"{prefix}_{counters[prefix]:03d}.png"
+            path.write_bytes(section.screenshot())
             log("SHOT", f"{path.name} (accordion {i+1}/{total})")
             took += 1
         except Exception as e:
@@ -451,204 +700,20 @@ def screenshot_modal_accordions(
     return took
 
 
-# ---------- HumanTrak dropdown helpers (robust & pixel-aware) ----------
-def short_token_for_label(label: str) -> str:
-    """A short, unique substring we can reliably match in truncated UI text."""
-    if "Ankle Dorsiflexion" in label:
-        return "Ankle Dorsiflexion"
-    if "Hip Adduction" in label:
-        return "Hip Adduction"
-    if "Peak Knee Flexion" in label:
-        return "Peak Knee Flexion"
-    return label[:24]
-
-
-def _get_chart_locator(tile: Locator) -> Locator:
-    """Prefer a specific chart node to fingerprint; fallback to tile."""
-    # Prefer canvas if present (common for HumanTrak)
-    canvas = tile.locator("canvas").first
-    if canvas.count() > 0:
-        return canvas
-    # Else an SVG inside a wrapper
-    svg = tile.locator(".recharts-wrapper svg, svg").first
-    if svg.count() > 0:
-        return svg
-    # Else the wrapper itself
-    wrapper = tile.locator(".recharts-wrapper").first
-    if wrapper.count() > 0:
-        return wrapper
-    # Fallback to entire tile
-    return tile
-
-
-def _fingerprint(locator: Locator) -> str:
-    """PNG bytes hash for pixel-level change detection."""
-    data = _shot_bytes(locator)
-    return hashlib.sha256(data).hexdigest()
-
-
-def _open_metric_menu(tile: Locator, attempts: int = 4) -> Locator:
-    """Open the tile's metric dropdown menu robustly and return the menu locator."""
-    page = tile.page
-    btn = tile.locator('[data-testid="metric-dropdown-button"]').first
-    expect(btn).to_be_visible(timeout=12000)
-    btn.scroll_into_view_if_needed()
-
-    for _ in range(attempts):
-        try:
-            btn.click()
-        except Exception:
-            pass
-        menu = tile.locator('[data-testid="metric-dropdown-items"]').first
-        try:
-            expect(menu).to_be_visible(timeout=2500)
-            return menu
-        except Exception:
-            page.wait_for_timeout(250)
-
-    # Last try: click button via coordinates to avoid overlay swallowing clicks
+def close_modal(page: Page, modal: Locator) -> None:
+    log("MODAL", "Closing...")
+    btn = modal.locator(
+        '[data-testid="close-button"], button[aria-label="Close"]'
+    ).first
+    if btn.count() > 0 and btn.is_visible():
+        btn.click()
+    else:
+        page.mouse.click(10, 10)
     try:
-        btn.click(position={"x": 10, "y": 10})
-        menu = tile.locator('[data-testid="metric-dropdown-items"]').first
-        expect(menu).to_be_visible(timeout=2500)
-        return menu
+        expect(modal).not_to_be_visible(timeout=10000)
+        log("MODAL", "Closed.")
     except Exception:
-        raise TimeoutError("Metric dropdown did not open for tile.")
-
-
-def select_metric_and_wait(
-    page: Page, tile: Locator, label: str, timeout_ms: int = 10000
-) -> None:
-    """
-    Open the dropdown, click the exact label, then wait until BOTH:
-      1) The button text contains the label's short token (handles truncation)
-      2) The chart PIXEL fingerprint changes (canvas/SVG safe)
-    """
-    token = short_token_for_label(label)
-
-    # Snapshot chart fingerprint BEFORE selection
-    chart_before = _get_chart_locator(tile)
-    fp_before = _fingerprint(chart_before)
-
-    # Open dropdown (robust)
-    menu = _open_metric_menu(tile)
-
-    # Click the exact option text
-    option = menu.get_by_role("menuitem", name=re.compile(rf"^{re.escape(label)}\s*$"))
-    expect(option.first).to_be_visible(timeout=8000)
-    option.first.scroll_into_view_if_needed()
-    option.first.click(force=True)
-
-    # Ensure menu closed
-    try:
-        expect(menu).not_to_be_visible(timeout=3000)
-    except Exception:
-        pass
-
-    # 1) Verify button text reflects new selection (truncate-aware)
-    btn = tile.locator('[data-testid="metric-dropdown-button"]').first
-    span = btn.locator("span.truncate").first
-    try:
-        expect(span).to_contain_text(
-            re.compile(re.escape(token), re.I), timeout=timeout_ms
-        )
-    except Exception:
-        # give the UI another small beat then re-check
-        page.wait_for_timeout(800)
-        expect(span).to_contain_text(re.compile(re.escape(token), re.I), timeout=3000)
-
-    # 2) Wait for chart pixel fingerprint to change (canvas/SVG aware)
-    deadline = time.time() + (timeout_ms / 1000.0)
-    while time.time() < deadline:
-        chart_after = _get_chart_locator(tile)  # re-query in case of re-render
-        try:
-            fp_after = _fingerprint(chart_after)
-            if fp_after != fp_before:
-                break
-        except Exception:
-            pass
-        page.wait_for_timeout(150)
-
-    # small final settle
-    page.wait_for_timeout(MENU_AFTER_SELECT)
-
-
-def bounce_then_reselect(
-    page: Page, tile: Locator, desired_label: str, alternatives: List[str]
-) -> None:
-    """To break sticky renders, switch to an alternative metric briefly, then back to desired."""
-    alt = next((x for x in alternatives if x != desired_label), None)
-    if not alt:
-        return
-    try:
-        select_metric_and_wait(page, tile, alt)
-        page.wait_for_timeout(400)
-    except Exception:
-        pass
-    select_metric_and_wait(page, desired_label)
-
-
-def capture_humantrak_card(
-    page: Page,
-    title: str,
-    labels_to_capture: List[str],
-    save_dir: Path,
-    counters: defaultdict,
-    include_base: bool = False,  # False -> exactly one shot per label
-) -> int:
-    """
-    Take exactly one screenshot per requested metric label (and optionally one base shot).
-    Uses robust selection + pixel fingerprinting + bytes hashing + bounce strategy
-    to avoid duplicates when the list reorders itself or re-renders slowly.
-    """
-    tile = tile_humantrak_by_title(page, title)
-    if tile.count() == 0 or not tile.is_visible():
-        tile = tile_by_heading_fallback(page, title)
-    expect(tile).to_be_visible(timeout=15000)
-
-    taken = 0
-    seen_hashes: set = set()
-    prefix = title.replace(" ", "_")
-
-    if include_base:
-        log("CARD", f"{title}: base screenshot")
-        move_mouse_off_view(page)
-        if screenshot_tile_unique(tile, save_dir, prefix, counters, seen_hashes):
-            taken += 1
-
-    for label in labels_to_capture:
-        success = False
-        for attempt in range(1, 4):
-            try:
-                log("CARD", f"{title}: selecting '{label}' (attempt {attempt}/3)")
-                select_metric_and_wait(page, tile, label)
-                move_mouse_off_view(page)
-                if screenshot_tile_unique(
-                    tile, save_dir, prefix, counters, seen_hashes
-                ):
-                    success = True
-                    taken += 1
-                    break
-                else:
-                    # If duplicate bytes, try bouncing to another metric and back
-                    log(
-                        "CARD",
-                        f"{title}: duplicate after select, bouncing via alt metric...",
-                    )
-                    bounce_then_reselect(page, tile, label, labels_to_capture)
-                    move_mouse_off_view(page)
-            except Exception as e:
-                log("CARD", f"(retry) '{title}' -> '{label}' failed: {e}")
-                page.wait_for_timeout(600)
-
-        if not success:
-            log(
-                "CARD",
-                f"(skip) '{title}' -> '{label}' produced duplicate content after retries.",
-            )
-
-    log("CARD", f"{title}: done ({taken} shots)")
-    return taken
+        log("MODAL", "Close check timed-out; continuing.")
 
 
 # ===================== PER-ATHLETE FLOW =====================
@@ -659,20 +724,22 @@ def take_screens_for_athlete(page: Page, out_dir: Path, athlete_name: str) -> No
     save_dir.mkdir(parents=True, exist_ok=True)
     counters: defaultdict = defaultdict(int)
 
+    # Try to pre-validate CMJ presence (non-fatal)
     try:
-        expect(tile_forcedecks_by_name(page, "Countermovement Jump")).to_be_visible(
-            timeout=20000
-        )
-    except Exception:
-        log("FLOW", "CMJ tile not found immediately; proceeding anyway.")
+        cmj_tile = find_countermovement_jump_tile(page)
+        if cmj_tile:
+            log("FLOW", "CMJ tile detected on overview.")
+        else:
+            log(
+                "FLOW", "CMJ tile not detected (may be absent); will still try to open."
+            )
+    except Exception as e:
+        log("FLOW", f"CMJ pre-check failed: {e}")
     page.wait_for_timeout(300)
 
     # ---------- Modal tiles (accordion-based) ----------
     for label, opener in [
-        (
-            "Countermovement_Jump",
-            lambda: open_modal_forcedecks_by_name(page, "Countermovement Jump"),
-        ),
+        ("Countermovement_Jump", lambda: open_modal_countermovement_jump(page)),
         ("Nordic", lambda: open_modal_by_testid(page, "nordbord-tile")),
         (
             "20yd_Sprint",
@@ -707,28 +774,25 @@ def take_screens_for_athlete(page: Page, out_dir: Path, athlete_name: str) -> No
     except Exception as e:
         log("FLOW", f"(warn) Overhead Squat failed: {e}")
 
+    # Lunge title can be "Lunge" or "Lunges" depending on UI version
     try:
-        capture_humantrak_card(
-            page, "Lunge", ht_labels, save_dir, counters, include_base=False
+        capture_humantrak_card_any(
+            page, ["Lunge", "Lunges"], ht_labels, save_dir, counters, include_base=False
         )
     except Exception as e:
-        log("FLOW", f"(warn) Lunge failed: {e}")
+        log("FLOW", f"(warn) Lunge/Lunges failed: {e}")
 
     total = sum(counters.values())
     log("FLOW", f"Athlete '{athlete_name}' complete. Total images: {total}")
 
 
-# ===================== TEAM SELECTION HELPERS =====================
+# ===================== TEAM / SEARCH HELPERS =====================
 def open_groups_dropdown(page: Page) -> None:
-    """Robustly open the Groups react-select dropdown (no fragile 'All Groups' text match)."""
-    # Ensure we're on profiles and scrolled to top
     ensure_profiles_page(page)
     page.evaluate("window.scrollTo(0,0)")
     page.wait_for_timeout(100)
-
     control = page.locator(".react-select__control").first
     expect(control).to_be_visible(timeout=15000)
-
     attempts = 0
     while attempts < 4:
         try:
@@ -741,16 +805,13 @@ def open_groups_dropdown(page: Page) -> None:
         except Exception:
             attempts += 1
             page.wait_for_timeout(300)
-    # last resort
     control.click(position={"x": 10, "y": 10})
     expect(page.locator(".react-select__menu")).to_be_visible(timeout=3000)
 
 
 def clear_all_selected_groups(page: Page) -> None:
-    """If chips are present, remove them so only one team is selected for filtering."""
     control = page.locator(".react-select__control").first
     try:
-        # Remove all 'x' chips if present
         while True:
             remove_btns = control.locator(".react-select__multi-value__remove")
             if remove_btns.count() == 0:
@@ -762,7 +823,6 @@ def clear_all_selected_groups(page: Page) -> None:
 
 
 def list_all_group_options(page: Page) -> List[str]:
-    """Return visible option texts currently shown in the open dropdown."""
     options = page.locator(".react-select__menu .react-select__option")
     count = options.count()
     texts = []
@@ -777,7 +837,6 @@ def list_all_group_options(page: Page) -> List[str]:
 
 
 def select_group_option_exact(page: Page, label: str) -> None:
-    """Select a single option by exact visible label from the open dropdown."""
     options = page.locator(".react-select__menu .react-select__option")
     target = options.filter(has_text=re.compile(rf"^{re.escape(label)}$"))
     if target.count() == 0:
@@ -799,17 +858,21 @@ def select_group_option_exact(page: Page, label: str) -> None:
 def prompt_team_mode() -> Tuple[str, List[str]]:
     """
     Ask user which selection mode to use.
-    Returns ("prefix", [prefix])  OR  ("list", [names...])
+    Returns one of:
+      ("prefix", [prefix])
+      ("list", [names...])
+      ("single", [search_text])
     """
-    print("\n=== Team selection ===")
+    print("\n=== Team/Profile selection ===")
     print(
         "1) Start-text mode (e.g., 'KC Fusion' -> process ALL teams that start with it)"
     )
     print(
-        "2) Explicit list (paste comma-separated names OR path to a .txt with one per line)"
+        "2) Explicit team list (paste comma-separated OR path to a .txt with one per line)"
     )
-    mode = input("Pick 1 or 2 (default 1): ").strip() or "1"
-    if mode not in ("1", "2"):
+    print("3) Single profile via search (type full/partial athlete name)")
+    mode = input("Pick 1, 2 or 3 (default 1): ").strip() or "1"
+    if mode not in ("1", "2", "3"):
         mode = "1"
 
     if mode == "1":
@@ -817,7 +880,7 @@ def prompt_team_mode() -> Tuple[str, List[str]]:
             input("Enter starting text (default 'KC Fusion'): ").strip() or "KC Fusion"
         )
         return "prefix", [prefix]
-    else:
+    elif mode == "2":
         raw = input("Paste comma-separated names OR a path to .txt: ").strip()
         names: List[str] = []
         if raw.lower().endswith(".txt") and Path(raw).exists():
@@ -833,6 +896,11 @@ def prompt_team_mode() -> Tuple[str, List[str]]:
                 if nm:
                     names.append(nm)
         return "list", names
+    else:  # "3"
+        query = input("Enter athlete name (full/partial) to search: ").strip()
+        if not query:
+            raise RuntimeError("Search text cannot be empty for single-profile mode.")
+        return "single", [query]
 
 
 def resolve_teams_by_prefix(page: Page, prefix: str) -> List[str]:
@@ -845,7 +913,6 @@ def resolve_teams_by_prefix(page: Page, prefix: str) -> List[str]:
 
 
 def set_filter_to_single_team(page: Page, team_name: str) -> None:
-    """Clear previous selections and set the filter to exactly one team."""
     log("FILTER", f"Setting filter to single team: {team_name}")
     clear_all_selected_groups(page)
     open_groups_dropdown(page)
@@ -855,18 +922,11 @@ def set_filter_to_single_team(page: Page, team_name: str) -> None:
     reset_zoom(page)
 
 
-# --- NEW: click the react-select “×” to clear the current team after finishing a team ---
 def clear_selected_team_via_cross(page: Page) -> None:
-    """
-    Click the react-select clear indicator (×) to clear current selection.
-    Works for both single- and multi-select variants.
-    """
     ensure_profiles_page(page)
     control = page.locator(".react-select__control").first
     if control.count() == 0:
         return
-
-    # Hover/focus can be required for the clear indicator to show
     try:
         control.hover()
     except Exception:
@@ -875,11 +935,9 @@ def clear_selected_team_via_cross(page: Page) -> None:
         control.click()
     except Exception:
         pass
-
     clear_btn = control.locator(".react-select__clear-indicator").first
     if clear_btn.count() == 0:
         return
-
     try:
         clear_btn.click(force=True)
     except Exception:
@@ -887,13 +945,177 @@ def clear_selected_team_via_cross(page: Page) -> None:
             clear_btn.click()
         except Exception:
             pass
-
-    # Give the table a brief moment to refresh (XHR lists)
     try:
         page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         page.wait_for_timeout(400)
     reset_zoom(page)
+
+
+# ===================== SEARCH (SINGLE PROFILE) =====================
+def _search_input(page: Page) -> Locator:
+    loc = page.locator(".search-input.search-input-profiles input").first
+    if loc.count() == 0:
+        loc = page.locator('input[placeholder="Search"]').first
+    return loc
+
+
+def apply_search_query(page: Page, query: str) -> None:
+    ensure_profiles_page(page)
+    box = _search_input(page)
+    expect(box).to_be_visible(timeout=10000)
+    box.click()
+    try:
+        box.fill("")
+    except Exception:
+        box.press("Control+a")
+        box.press("Delete")
+    box.type(query, delay=30)
+    page.wait_for_timeout(300)
+    try:
+        page.wait_for_load_state("networkidle", timeout=6000)
+    except Exception:
+        pass
+    reset_zoom(page)
+
+
+def clear_search_query(page: Page) -> None:
+    try:
+        box = _search_input(page)
+        if box.count() > 0 and box.is_visible():
+            box.click()
+            try:
+                box.fill("")
+            except Exception:
+                box.press("Control+a")
+                box.press("Delete")
+            page.wait_for_timeout(200)
+            try:
+                page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _is_probable_team_text(text: str, profile_name: str) -> bool:
+    t = text.strip()
+    if not t or t.lower() == profile_name.lower():
+        return False
+    if "@" in t:
+        return False
+    letters = sum(ch.isalpha() for ch in t)
+    digits = sum(ch.isdigit() for ch in t)
+    if letters < 4 or digits > letters:
+        return False
+    if any(sym in t for sym in ("/", ":", "-", "AM", "PM")):
+        if letters < 8:
+            return False
+    return True
+
+
+def infer_team_from_row(row: Locator, profile_name: str) -> Optional[str]:
+    try:
+        tds = row.locator("td")
+        count = tds.count()
+        candidates = []
+        for i in range(count):
+            try:
+                txt = tds.nth(i).inner_text().strip()
+            except Exception:
+                continue
+            if _is_probable_team_text(txt, profile_name):
+                candidates.append(txt)
+        if candidates:
+            return max(candidates, key=len)
+    except Exception:
+        pass
+    return None
+
+
+def collect_table_rows(page: Page) -> List[Locator]:
+    rows = page.locator("tbody tr")
+    n = rows.count()
+    return [rows.nth(i) for i in range(n)]
+
+
+def scrape_single_profile(page: Page, search_text: str) -> None:
+    """
+    Single-profile mode:
+      - Type into Profiles search box
+      - Pick exact-match row if possible, else first containing match, else first row
+      - Open overview, capture, and ALWAYS save under:
+          D:/Vald Data/Single Profile/<Athlete Name>/
+    """
+    ensure_profiles_page(page)
+    log("SINGLE", f"Searching for: {search_text}")
+    apply_search_query(page, search_text)
+
+    rows = collect_table_rows(page)
+    if not rows:
+        log("SINGLE", "No rows found for the search.")
+        return
+
+    chosen = None
+    exact_lower = search_text.strip().lower()
+    fallback_contains = None
+
+    for r in rows:
+        try:
+            name = r.locator("td").nth(1).inner_text().strip()
+        except Exception:
+            continue
+        if name.lower() == exact_lower:
+            chosen = r
+            break
+        if not fallback_contains and exact_lower in name.lower():
+            fallback_contains = r
+
+    if chosen is None:
+        chosen = fallback_contains or rows[0]
+
+    try:
+        profile_name = chosen.locator("td").nth(1).inner_text().strip()
+    except Exception:
+        profile_name = search_text.strip()
+
+    # ***** IMPORTANT CHANGE: Always save under "Single Profile" *****
+    team_dir_name = "Single Profile"
+    team_dir = OUTPUT_DIR / team_dir_name
+    team_dir.mkdir(parents=True, exist_ok=True)
+
+    athlete_safe = sanitize_filename(profile_name)
+    out_dir = team_dir / athlete_safe
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log("SINGLE", f"Selected athlete: {profile_name}")
+    log("SINGLE", f"Saving under: {team_dir_name}/{athlete_safe}")
+
+    # Open overview & capture
+    log("NAV", "Opening athlete overview...")
+    try:
+        chosen.locator('[aria-label="table-cell-initials"]').click()
+    except Exception:
+        # if initials cell not clickable, try clicking the name cell, then the whole row
+        try:
+            chosen.locator("td").nth(1).click()
+        except Exception:
+            chosen.click()
+
+    expect(page).to_have_url(re.compile(r".*/overview"), timeout=30000)
+    page.wait_for_timeout(400)
+
+    try:
+        take_screens_for_athlete(page, out_dir, profile_name)
+    except Exception as e:
+        log("ERROR", f"While capturing '{athlete_safe}': {e}")
+
+    # back to list & clear search box (tidy state)
+    log("NAV", "Back to profiles list...")
+    page.go_back()
+    ensure_profiles_page(page)
+    clear_search_query(page)
+    log("SINGLE", "✅ Single profile capture complete.")
 
 
 # ===================== CLEANUP RUNNER =====================
@@ -972,8 +1194,15 @@ def main():
             # ----- profiles page -----
             ensure_profiles_page(page)
 
-            # ----- interactive team selection -----
+            # ----- interactive team/profile selection -----
             mode, values = prompt_team_mode()
+
+            if mode == "single":
+                search_text = values[0]
+                scrape_single_profile(page, search_text)
+                log("DONE", "✅ Single profile processed.")
+                return
+
             if mode == "prefix":
                 prefix = values[0]
                 log("FILTER", f"Selecting teams by prefix: '{prefix}'")
@@ -990,7 +1219,6 @@ def main():
             for idx, team_name in enumerate(teams, start=1):
                 log("TEAM", f"[{idx}/{len(teams)}] {team_name}")
 
-                # ensure we're on the profiles list before switching teams
                 ensure_profiles_page(page)
                 open_groups_dropdown(page)
                 set_filter_to_single_team(page, team_name)
@@ -1013,7 +1241,6 @@ def main():
                         except Exception:
                             continue
 
-                        # Skip obvious test rows with digits
                         if re.search(r"\d", profile_name):
                             log("TABLE", f"Skip test profile: {profile_name}")
                             continue
@@ -1027,7 +1254,6 @@ def main():
                         out_dir = team_dir / safe
                         out_dir.mkdir(parents=True, exist_ok=True)
 
-                        # open athlete overview
                         log("NAV", "Opening athlete overview...")
                         row.locator('[aria-label="table-cell-initials"]').click()
                         expect(page).to_have_url(
@@ -1041,7 +1267,6 @@ def main():
                         except Exception as e:
                             log("ERROR", f"While capturing '{safe}': {e}")
 
-                        # back to list
                         log("NAV", "Back to profiles list...")
                         page.go_back()
                         ensure_profiles_page(page)
@@ -1058,7 +1283,6 @@ def main():
 
                 log("TEAM", f"✅ Team complete: {team_name}")
 
-                # NEW: clear the selected team via the “×” so the next team won't merge
                 try:
                     clear_selected_team_via_cross(page)
                     log("FILTER", "Cleared team selection via ×.")
